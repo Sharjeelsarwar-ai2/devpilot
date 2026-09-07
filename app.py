@@ -4,6 +4,7 @@ import zipfile
 import shutil
 import subprocess
 import tempfile
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -211,7 +212,7 @@ def sandbox_call(mode: str, workspace: Path, target: str = "", timeout: int = 20
         return {"ok": False, "error": "sandbox_runner.py is missing from the deployment."}
 
     command = [
-        os.environ.get("PYTHON", "python"),
+        sys.executable,
         str(SANDBOX_RUNNER),
         "--mode", mode,
         "--workspace", str(workspace),
@@ -387,10 +388,16 @@ def execute_tool(workspace: Path, name: str, args: Dict[str, Any]) -> Dict[str, 
         else:
             set_stage("Implement changes", "error", detail)
     elif name in {"run_python", "run_tests", "smoke_test_streamlit"}:
+        st.session_state.verification_seen = True
         if result.get("ok"):
+            st.session_state.verification_passed = True
             set_stage("Run verification", "done", "Sandbox verification passed")
-            set_stage("Fix issues", "skipped", "No verification failure")
+            if st.session_state.step_state["Fix issues"] == "active":
+                set_stage("Fix issues", "done", "Verification passed after fixes")
+            elif st.session_state.step_state["Fix issues"] == "pending":
+                set_stage("Fix issues", "skipped", "No verification failure")
         else:
+            st.session_state.verification_passed = False
             set_stage("Run verification", "error", "Sandbox verification failed")
             set_stage("Fix issues", "active", "Analyzing verification failure")
     return result
@@ -424,6 +431,8 @@ def render_progress(timeline, progress, status) -> None:
 def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progress_ui) -> str:
     st.session_state.agent_events = []
     st.session_state.agent_step = 0
+    st.session_state.verification_passed = False
+    st.session_state.verification_seen = False
     st.session_state.step_state = {name: "pending" for name, _ in DEFAULT_STEPS}
     st.session_state.step_detail = {name: detail for name, detail in DEFAULT_STEPS}
     set_stage("Understand requirement", "active", "Parsing requested change")
@@ -464,12 +473,29 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
         messages.append(assistant)
 
         if not message.tool_calls:
+            # Do not allow a green final state without successful verification.
+            if not st.session_state.verification_passed:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Do not finalize yet. Verification has not passed. "
+                        "Use the appropriate verification tool now. If verification "
+                        "failed, inspect the diagnostics, fix the code, and verify again "
+                        "before giving the final report."
+                    ),
+                })
+                set_stage("Run verification", "active", "Verification required before finalizing")
+                render_progress(*progress_ui)
+                continue
+
             response_text = message.content or "Agent finished without a final report."
             for stage in ["Design solution", "Implement changes", "Run verification"]:
                 if st.session_state.step_state[stage] == "active":
                     set_stage(stage, "done", "Completed")
             if st.session_state.step_state["Fix issues"] == "pending":
                 set_stage("Fix issues", "skipped", "No verification failures")
+            elif st.session_state.step_state["Fix issues"] == "active":
+                set_stage("Fix issues", "done", "Verification passed after fixes")
             set_stage("Finalize", "active", "Generating final report")
             render_progress(*progress_ui)
             set_stage("Finalize", "done", "Final report generated")
