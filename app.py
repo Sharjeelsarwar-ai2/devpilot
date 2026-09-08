@@ -110,6 +110,12 @@ for key, value in {
     "agent_events": [],
     "agent_step": 0,
     "running": False,
+    "run_success": False,
+    "verification_passed": False,
+    "verification_failed": False,
+    "verification_blocked": False,
+    "streamlit_verification_required": False,
+    "streamlit_smoke_passed": False,
     "step_state": {name: "pending" for name, _ in DEFAULT_STEPS},
     "step_detail": {name: detail for name, detail in DEFAULT_STEPS},
 }.items():
@@ -200,6 +206,31 @@ def write_file(workspace: Path, path: str, content: str) -> Dict[str, Any]:
     target = safe_workspace_path(workspace, path)
     if target.name in {".env", "secrets.toml"} or "secrets" in target.parts:
         return {"ok": False, "error": "Writing secret files is blocked."}
+    # Prevent accidental dependency-shadowing files that can hide the real
+    # package/environment failure (for example streamlit.py).
+    blocked_shadow_modules = {
+        "streamlit.py", "groq.py", "pytest.py", "subprocess.py",
+        "socket.py", "ssl.py", "json.py", "os.py", "sys.py",
+        "pathlib.py", "typing.py", "tempfile.py", "zipfile.py"
+    }
+    if target.name in blocked_shadow_modules:
+        return {
+            "ok": False,
+            "error": f"Refusing to create dependency-shadowing module: {path}"
+        }
+    if target.name == "__init__.py" and any(part in {"streamlit", "groq", "pytest"} for part in target.parts[:-1]):
+        return {
+            "ok": False,
+            "error": f"Refusing to create a dependency-shadowing package: {path}"
+        }
+
+    blocked_shadow_names = {
+        "streamlit.py", "groq.py", "pytest.py", "subprocess.py", "os.py",
+        "sys.py", "json.py", "socket.py", "requests.py", "typing.py",
+        "pathlib.py", "tempfile.py", "shutil.py", "zipfile.py"
+    }
+    if target.name in blocked_shadow_names:
+        return {"ok": False, "error": f"Refusing to create a module that shadows a runtime dependency: {target.name}"}
     if len(content.encode("utf-8")) > MAX_FILE_BYTES:
         return {"ok": False, "error": f"Refusing to write more than {MAX_FILE_BYTES} bytes to one file."}
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +287,11 @@ def sandbox_call(mode: str, workspace: Path, target: str = "", timeout: int = 20
         }
     if result.returncode != 0 and payload.get("ok", False):
         payload["ok"] = False
+    error_text = str(payload.get("error", ""))
+    if "preexec_fn" in error_text or "permission denied" in error_text.lower() or "operation not permitted" in error_text.lower():
+        payload["ok"] = False
+        payload["category"] = "sandbox_infrastructure"
+        payload["fatal"] = True
     return payload
 
 
@@ -335,6 +371,8 @@ Execution and safety rules:
 12. Never claim that a change works unless verification actually passed.
 13. Keep working until the requirement is implemented and verified or there is a genuine blocker.
 14. Final response must contain: files changed, changes made, verification performed, remaining issues.
+15. Never create fake/shim modules to bypass a missing dependency. In particular, never create files such as streamlit.py, groq.py, pytest.py, or other modules that shadow installed libraries.
+16. A tool call returning ok=false is a real failure. Do not describe it as successful; diagnose it and retry or report the blocker.
 
 write_file replaces the entire file. Read an existing file first.
 """
@@ -389,15 +427,35 @@ def execute_tool(workspace: Path, name: str, args: Dict[str, Any]) -> Dict[str, 
             set_stage("Implement changes", "error", detail)
     elif name in {"run_python", "run_tests", "smoke_test_streamlit"}:
         st.session_state.verification_seen = True
-        if result.get("ok"):
-            st.session_state.verification_passed = True
-            set_stage("Run verification", "done", "Sandbox verification passed")
+
+        if name == "smoke_test_streamlit":
+            st.session_state.streamlit_verification_required = True
+            st.session_state.streamlit_smoke_passed = bool(result.get("ok"))
+
+        if result.get("fatal") or result.get("category") == "sandbox_infrastructure":
+            st.session_state.verification_passed = False
+            st.session_state.verification_failed = True
+            st.session_state.verification_blocked = True
+            set_stage("Run verification", "error", "Sandbox infrastructure failure")
+            set_stage("Fix issues", "error", "Cannot safely repair an execution-environment failure")
+            return result
+
+        # A general verification result cannot overwrite a failed required
+        # Streamlit smoke test. The required smoke test must pass separately.
+        st.session_state.verification_failed = not bool(result.get("ok"))
+        st.session_state.verification_passed = (
+            bool(result.get("ok"))
+            and (not st.session_state.streamlit_verification_required
+                 or st.session_state.streamlit_smoke_passed)
+        )
+
+        if st.session_state.verification_passed:
+            set_stage("Run verification", "done", "All required sandbox verification passed")
             if st.session_state.step_state["Fix issues"] == "active":
                 set_stage("Fix issues", "done", "Verification passed after fixes")
             elif st.session_state.step_state["Fix issues"] == "pending":
                 set_stage("Fix issues", "skipped", "No verification failure")
         else:
-            st.session_state.verification_passed = False
             set_stage("Run verification", "error", "Sandbox verification failed")
             set_stage("Fix issues", "active", "Analyzing verification failure")
     return result
@@ -435,6 +493,8 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
     st.session_state.verification_seen = False
     st.session_state.step_state = {name: "pending" for name, _ in DEFAULT_STEPS}
     st.session_state.step_detail = {name: detail for name, detail in DEFAULT_STEPS}
+    st.session_state.verification_passed = False
+    st.session_state.verification_failed = False
     set_stage("Understand requirement", "active", "Parsing requested change")
     render_progress(*progress_ui)
 
@@ -489,6 +549,15 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
                 continue
 
             response_text = message.content or "Agent finished without a final report."
+            if not st.session_state.verification_passed:
+                set_stage("Finalize", "error", "Final report withheld because verification has not passed")
+                st.session_state.run_success = False
+                render_progress(*progress_ui)
+                return (
+                    "The agent stopped without a verified result. No successful finalization was recorded.\n\n"
+                    + response_text
+                )
+            st.session_state.run_success = True
             for stage in ["Design solution", "Implement changes", "Run verification"]:
                 if st.session_state.step_state[stage] == "active":
                     set_stage(stage, "done", "Completed")
@@ -510,8 +579,19 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
                 result = {"ok": False, "error": str(exc)}
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(result, ensure_ascii=False)})
             render_progress(*progress_ui)
+            if result.get("fatal") or result.get("category") == "sandbox_infrastructure":
+                st.session_state.run_success = False
+                set_stage("Finalize", "error", "Execution environment blocked verification")
+                render_progress(*progress_ui)
+                return (
+                    "Development blocked: the sandbox execution environment failed before the project could be verified. "
+                    f"Diagnostic: {result.get('error', 'unknown sandbox error')}\n\n"
+                    "No code changes should be made to work around this environment problem. "
+                    "Check that the deployed sandbox_runner.py matches the current version and that the runtime permits subprocess creation."
+                )
     else:
-        response_text = "The agent reached its maximum step limit before producing a final report. Review the activity log and verification results."
+        response_text = "The agent reached its maximum step limit before producing a verified final report. Review the activity log and verification results."
+        st.session_state.run_success = False
         set_stage("Finalize", "error", "Step limit reached")
         render_progress(*progress_ui)
     return response_text
@@ -571,7 +651,10 @@ if run_clicked:
         with st.spinner("Agent is reasoning and executing tools..."):
             final_report = run_agent(workspace, requirement.strip(), client, model.strip() or DEFAULT_MODEL, (timeline, progress, status))
         st.session_state.final_report = final_report
-        st.success("Development run completed.")
+        if st.session_state.verification_passed and not st.session_state.verification_failed:
+            st.success("Development run completed and verified.")
+        else:
+            st.warning("Development run completed with an unresolved verification issue.")
     except zipfile.BadZipFile:
         st.error("The uploaded file is not a valid ZIP archive.")
     except Exception as exc:
