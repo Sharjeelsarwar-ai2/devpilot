@@ -9,6 +9,10 @@ from typing import Any, Dict, List
 
 import streamlit as st
 from groq import Groq
+try:
+    from groq import BadRequestError
+except ImportError:
+    BadRequestError = Exception
 
 st.set_page_config(
     page_title="DevPilot AI",
@@ -23,6 +27,8 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_TOOL_OUTPUT_CHARS = 12_000
 MAX_AGENT_STEPS = 16
 MAX_RECOVERY_ATTEMPTS = 2
+MAX_PATCH_TEXT_BYTES = 80_000
+MAX_CREATE_CHUNK_BYTES = 12_000
 GENERATED_TEST_PATH = "tests/test_devpilot_requirements.py"
 SANDBOX_RUNNER = Path(__file__).with_name("sandbox_runner.py")
 
@@ -183,7 +189,13 @@ def list_files(workspace: Path) -> Dict[str, Any]:
     return {"files": files[:500], "count": len(files)}
 
 
-def read_file(workspace: Path, path: str) -> Dict[str, Any]:
+def read_file(
+    workspace: Path,
+    path: str,
+    start_line: int = 1,
+    max_lines: int = 120,
+) -> Dict[str, Any]:
+    """Read a bounded line range so the model does not need whole files for small edits."""
     target = safe_workspace_path(workspace, path)
     if not target.exists():
         return {"ok": False, "error": f"File not found: {path}"}
@@ -192,22 +204,120 @@ def read_file(workspace: Path, path: str) -> Dict[str, Any]:
     size = target.stat().st_size
     if size > MAX_FILE_BYTES:
         return {"ok": False, "error": f"{path} is too large ({size} bytes)."}
+    if start_line < 1 or max_lines < 1 or max_lines > 500:
+        return {"ok": False, "error": "Invalid line range."}
     try:
-        text = target.read_text(encoding="utf-8")
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
     except UnicodeDecodeError:
         return {"ok": False, "error": f"{path} is not UTF-8 text."}
-    return {"ok": True, "path": path, "content": text}
+    start = start_line - 1
+    selected = lines[start:start + max_lines]
+    numbered = []
+    for idx, line in enumerate(selected, start=start_line):
+        numbered.append(f"{idx}: {line.rstrip(chr(10))}")
+    return {
+        "ok": True,
+        "path": path,
+        "start_line": start_line,
+        "end_line": min(start_line + len(selected) - 1, len(lines)) if selected else start_line,
+        "total_lines": len(lines),
+        "content": "\n".join(numbered),
+    }
 
 
-def write_file(workspace: Path, path: str, content: str) -> Dict[str, Any]:
+def search_file(workspace: Path, path: str, query: str, context_lines: int = 3) -> Dict[str, Any]:
+    """Find exact text in one file and return compact line-numbered context."""
+    target = safe_workspace_path(workspace, path)
+    if not target.exists() or not target.is_file():
+        return {"ok": False, "error": f"File not found: {path}"}
+    if not query.strip():
+        return {"ok": False, "error": "Search query cannot be empty."}
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        return {"ok": False, "error": f"{path} is not UTF-8 text."}
+    matches = []
+    q = query.lower()
+    for i, line in enumerate(lines):
+        if q in line.lower():
+            lo = max(0, i - max(0, context_lines))
+            hi = min(len(lines), i + max(0, context_lines) + 1)
+            context = [f"{j + 1}: {lines[j]}" for j in range(lo, hi)]
+            matches.append({"line": i + 1, "context": "\n".join(context)})
+            if len(matches) >= 20:
+                break
+    return {"ok": True, "path": path, "query": query, "matches": matches, "count": len(matches)}
+
+
+BLOCKED_SHADOW_NAMES = {
+    "streamlit.py", "groq.py", "pytest.py", "subprocess.py", "json.py",
+    "os.py", "sys.py", "pathlib.py", "typing.py", "requests.py"
+}
+
+
+def _validate_write_target(workspace: Path, path: str) -> tuple[Path, Dict[str, Any] | None]:
     target = safe_workspace_path(workspace, path)
     if target.name in {".env", "secrets.toml"} or "secrets" in target.parts:
-        return {"ok": False, "error": "Writing secret files is blocked."}
-    if len(content.encode("utf-8")) > MAX_FILE_BYTES:
-        return {"ok": False, "error": f"Refusing to write more than {MAX_FILE_BYTES} bytes to one file."}
+        return target, {"ok": False, "error": "Writing secret files is blocked."}
+    if target.name in BLOCKED_SHADOW_NAMES or any(
+        part in {n.removesuffix(".py") for n in BLOCKED_SHADOW_NAMES}
+        for part in target.relative_to(workspace).parts[:-1]
+    ):
+        return target, {"ok": False, "error": f"Dependency-shadowing path is blocked: {path}"}
+    return target, None
+
+
+def create_file(workspace: Path, path: str, content: str) -> Dict[str, Any]:
+    """Create a new file. Large files should be created in chunks with append_file."""
+    target, error = _validate_write_target(workspace, path)
+    if error:
+        return error
+    if target.exists():
+        return {"ok": False, "error": f"File already exists: {path}. Use apply_patch or append_file."}
+    size = len(content.encode("utf-8"))
+    if size > MAX_CREATE_CHUNK_BYTES:
+        return {"ok": False, "error": f"create_file accepts at most {MAX_CREATE_CHUNK_BYTES} bytes. Create the file in smaller chunks."}
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return {"ok": True, "path": path, "bytes_written": len(content.encode("utf-8"))}
+    return {"ok": True, "path": path, "bytes_written": size, "mode": "create"}
+
+
+def append_file(workspace: Path, path: str, content: str) -> Dict[str, Any]:
+    """Append a small chunk to an existing file."""
+    target, error = _validate_write_target(workspace, path)
+    if error:
+        return error
+    if not target.exists():
+        return {"ok": False, "error": f"File does not exist: {path}. Create it first with create_file."}
+    size = len(content.encode("utf-8"))
+    if size > MAX_CREATE_CHUNK_BYTES:
+        return {"ok": False, "error": f"append_file accepts at most {MAX_CREATE_CHUNK_BYTES} bytes per chunk."}
+    with target.open("a", encoding="utf-8") as f:
+        f.write(content)
+    return {"ok": True, "path": path, "bytes_appended": size, "mode": "append"}
+
+
+def apply_patch(workspace: Path, path: str, old_text: str, new_text: str) -> Dict[str, Any]:
+    """Replace one exact existing text block. This keeps LLM edits small and localized."""
+    target, error = _validate_write_target(workspace, path)
+    if error:
+        return error
+    if not target.exists() or not target.is_file():
+        return {"ok": False, "error": f"File not found: {path}"}
+    old_size = len(old_text.encode("utf-8"))
+    new_size = len(new_text.encode("utf-8"))
+    if old_size == 0:
+        return {"ok": False, "error": "old_text cannot be empty."}
+    if old_size > MAX_PATCH_TEXT_BYTES or new_size > MAX_PATCH_TEXT_BYTES:
+        return {"ok": False, "error": f"Patch blocks must be at most {MAX_PATCH_TEXT_BYTES} bytes."}
+    text = target.read_text(encoding="utf-8")
+    count = text.count(old_text)
+    if count == 0:
+        return {"ok": False, "error": "Patch target was not found. Re-read or search the relevant section and retry."}
+    if count > 1:
+        return {"ok": False, "error": f"Patch target matched {count} locations. Make the old_text more specific."}
+    target.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+    return {"ok": True, "path": path, "mode": "patch", "bytes_delta": new_size - old_size}
 
 
 def sandbox_call(mode: str, workspace: Path, target: str = "", timeout: int = 20) -> Dict[str, Any]:
@@ -306,13 +416,17 @@ def smoke_test_streamlit(workspace: Path, path: str) -> Dict[str, Any]:
 
 
 TOOLS = [
-    {"type": "function", "function": {"name": "list_files", "description": "List project files.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "read_file", "description": "Read a UTF-8 text file before editing it.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "write_file", "description": "Create or replace a UTF-8 text file in the project workspace.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "run_python", "description": "Run a normal Python script inside the controlled sandbox. For Streamlit code it performs a sandboxed syntax check instead.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "run_tests", "description": "Run requirement-level pytest tests in the controlled sandbox when tests exist; otherwise compile-check Python files. For Streamlit requirements, generated tests should prefer streamlit.testing.v1.AppTest to exercise widgets and behavior without a browser.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "smoke_test_streamlit", "description": "Launch a Streamlit app in a short-lived controlled sandbox process, verify that localhost HTTP responds, collect startup diagnostics, then terminate it.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Relative path to the Streamlit entry file, e.g. app.py"}}, "required": ["path"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "list_files", "description": "List project files.", "strict": True, "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read a bounded line range from a UTF-8 file. Prefer this over reading whole files.", "strict": True, "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "max_lines": {"type": "integer", "minimum": 1, "maximum": 120}}, "required": ["path"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "search_file", "description": "Find exact text in one file and return compact line-numbered context.", "strict": True, "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "query": {"type": "string"}, "context_lines": {"type": "integer", "minimum": 0, "maximum": 8}}, "required": ["path", "query"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "apply_patch", "description": "Patch one exact existing code block. Read or search the target first. Do not replace the whole file.", "strict": True, "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string", "description": "Exact existing block to replace once"}, "new_text": {"type": "string", "description": "Only the replacement block"}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "create_file", "description": "Create a new file using a small chunk. For files larger than the chunk limit, create the first chunk then use append_file.", "strict": True, "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "append_file", "description": "Append a small chunk to an existing file. Use multiple calls for large new files.", "strict": True, "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "run_python", "description": "Run a normal Python script inside the controlled sandbox. For Streamlit code it performs a sandboxed syntax check instead.", "strict": True, "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "run_tests", "description": "Run pytest in the controlled sandbox when tests exist, otherwise compile-check Python files.", "strict": True, "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "smoke_test_streamlit", "description": "Launch a Streamlit app in a short-lived controlled sandbox process, verify localhost HTTP responds, then terminate it.", "strict": True, "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}}},
 ]
+
 
 SYSTEM_PROMPT = """
 You are DevPilot, an autonomous software development agent working inside a temporary project workspace.
@@ -322,30 +436,34 @@ Your job is to implement the user's requirement, not merely explain it.
 Available tools:
 - list_files
 - read_file
-- write_file
+- search_file
+- apply_patch
+- create_file
+- append_file
 - run_python
 - run_tests
 - smoke_test_streamlit
 
 Execution and safety rules:
 1. Start by inspecting the project. Usually call list_files first.
-2. Read relevant files before changing them.
+2. Search/read only the relevant sections before changing them.
 3. Make the smallest coherent set of changes needed.
-4. Preserve the project's existing architecture and UI style when practical.
-5. Never invent unseen file contents when replacing existing files.
-6. Never write secrets, credentials, .env files or secret configuration.
-7. Never delete the whole project.
-8. Use run_tests after implementation when possible.
-9. For a functional requirement, generate requirement-level tests in tests/test_devpilot_requirements.py before final verification.
-10. Prefer black-box behavioral tests. For Streamlit apps, use streamlit.testing.v1.AppTest where practical to exercise widgets and visible behavior without a browser.
-11. Run the generated tests with run_tests, then use smoke_test_streamlit on the Streamlit entry point before claiming the app starts correctly.
-12. If verification fails because of project code, inspect the diagnostic output, fix the relevant code, and verify again. Do not change project code to hide a sandbox/infrastructure failure.
-13. Remember that the execution tools run inside a controlled, resource-limited subprocess environment. Do not attempt to escape it or weaken the controls.
-14. Never claim that a change works unless the required functional verification actually passed.
-15. Keep working until the requirement is implemented and verified or there is a genuine blocker.
-16. Final response must contain: files changed, changes made, tests generated/run, smoke test status, and remaining issues.
+4. Modify existing files with apply_patch; do not rewrite whole files. Use create_file + append_file only for genuinely new files.
+5. Preserve the project's existing architecture and UI style when practical.
+6. Never invent unseen file contents when replacing existing files.
+7. Never write secrets, credentials, .env files or secret configuration.
+8. Never delete the whole project.
+9. Use run_tests after implementation when possible.
+10. For a functional requirement, generate requirement-level tests in tests/test_devpilot_requirements.py before final verification. Create that test file in chunks rather than one giant tool call.
+11. Prefer black-box behavioral tests. For Streamlit apps, use streamlit.testing.v1.AppTest where practical to exercise widgets and visible behavior without a browser.
+12. Run the generated tests with run_tests, then use smoke_test_streamlit on the Streamlit entry point before claiming the app starts correctly.
+13. If verification fails because of project code, inspect the diagnostic output, fix the relevant code, and verify again. Do not change project code to hide a sandbox/infrastructure failure.
+14. Remember that the execution tools run inside a controlled, resource-limited subprocess environment. Do not attempt to escape it or weaken the controls.
+15. Never claim that a change works unless the required functional verification actually passed.
+16. Keep working until the requirement is implemented and verified or there is a genuine blocker.
+17. Final response must contain: files changed, changes made, tests generated/run, smoke test status, and remaining issues.
 
-write_file replaces the entire file. Read an existing file first.
+Never use whole-file replacement for an existing file; use search_file/read_file + apply_patch.
 """
 
 
@@ -358,9 +476,9 @@ def set_stage(stage: str, state: str = "active", detail: str | None = None) -> N
 
 
 def infer_stage(name: str, args: Dict[str, Any] | None = None) -> str:
-    if name in {"list_files", "read_file"}:
+    if name in {"list_files", "read_file", "search_file"}:
         return "Inspect project"
-    if name == "write_file":
+    if name in {"apply_patch", "create_file", "append_file"}:
         return "Generate tests" if (args or {}).get("path") == GENERATED_TEST_PATH else "Implement changes"
     if name in {"run_python", "run_tests", "smoke_test_streamlit"}:
         return "Run verification"
@@ -373,8 +491,11 @@ def execute_tool(workspace: Path, name: str, args: Dict[str, Any]) -> Dict[str, 
         set_stage(stage, "active")
 
     if name == "list_files": result = list_files(workspace)
-    elif name == "read_file": result = read_file(workspace, args["path"])
-    elif name == "write_file": result = write_file(workspace, args["path"], args["content"])
+    elif name == "read_file": result = read_file(workspace, args["path"], args.get("start_line", 1), args.get("max_lines", 120))
+    elif name == "search_file": result = search_file(workspace, args["path"], args["query"], args.get("context_lines", 3))
+    elif name == "apply_patch": result = apply_patch(workspace, args["path"], args["old_text"], args["new_text"])
+    elif name == "create_file": result = create_file(workspace, args["path"], args["content"])
+    elif name == "append_file": result = append_file(workspace, args["path"], args["content"])
     elif name == "run_python": result = run_python(workspace, args["path"])
     elif name == "run_tests": result = run_tests(workspace)
     elif name == "smoke_test_streamlit": result = smoke_test_streamlit(workspace, args["path"])
@@ -404,9 +525,9 @@ def execute_tool(workspace: Path, name: str, args: Dict[str, Any]) -> Dict[str, 
     if name == "write_file" and args.get("path") == GENERATED_TEST_PATH and result.get("ok"):
         st.session_state.verification["requirement_tests_present"] = True
 
-    if name in {"list_files", "read_file"}:
+    if name in {"list_files", "read_file", "search_file"}:
         set_stage("Inspect project", "done" if result.get("ok", True) else "error", detail)
-    elif name == "write_file":
+    elif name in {"apply_patch", "create_file", "append_file"}:
         if result.get("ok"):
             set_stage("Design solution", "done", "Implementation plan executed")
             if args.get("path") == GENERATED_TEST_PATH:
@@ -457,6 +578,85 @@ def render_progress(timeline, progress, status) -> None:
         status.markdown("**Status:** Verification stopped with an issue")
 
 
+def request_agent(client: Groq, model: str, messages: List[Dict[str, Any]], allow_retry: bool = True):
+    """Call Groq with hardened tool-calling retries.
+
+    Groq validates tool-call JSON before returning a response. If the model emits
+    malformed arguments, our application cannot repair that response after the fact.
+    We therefore retry from the last valid conversation state with progressively
+    stricter instructions, then fail safely instead of looping or mutating files.
+    """
+    common = {
+        "model": model,
+        "messages": messages,
+        "tools": TOOLS,
+        "parallel_tool_calls": False,
+        "temperature": 0,
+    }
+
+    try:
+        return client.chat.completions.create(
+            **common,
+            tool_choice="auto",
+        )
+    except BadRequestError as exc:
+        text = str(exc)
+        malformed = "parse tool call arguments as JSON" in text or "tool_use_failed" in text
+        if not (allow_retry and malformed):
+            raise
+
+        # Retry #1: force exactly one tool call and prohibit large/free-form edits.
+        retry_messages = list(messages)
+        retry_messages.append({
+            "role": "user",
+            "content": (
+                "TOOL-CALL RECOVERY. The previous tool arguments were rejected as invalid JSON. "
+                "Do not repeat the rejected call verbatim. Use exactly ONE tool call. "
+                "For existing files, use apply_patch with a small exact old_text/new_text block. "
+                "For new files, use create_file or append_file in small chunks. "
+                "Keep each content string short. Escape backslashes and quotes as valid JSON. "
+                "Never add duplicate fields, markdown fences, or dependency-shadowing files."
+            ),
+        })
+        try:
+            return client.chat.completions.create(
+                **common,
+                messages=retry_messages,
+                tool_choice="required",
+            )
+        except BadRequestError as retry_exc:
+            retry_text = str(retry_exc)
+            if not ("parse tool call arguments as JSON" in retry_text or "tool_use_failed" in retry_text):
+                raise
+
+            # Retry #2 uses an even more constrained edit instruction. If this fails,
+            # stop safely. Never enter an LLM repair loop for a provider serialization error.
+            final_messages = list(messages)
+            final_messages.append({
+                "role": "user",
+                "content": (
+                    "FINAL TOOL FORMAT RECOVERY. Return one small valid tool call only. "
+                    "Do not rewrite whole files. Prefer apply_patch. "
+                    "The JSON arguments must contain only the schema fields and valid escaped JSON strings. "
+                    "If the requested edit is large, split it into multiple tool calls."
+                ),
+            })
+            try:
+                return client.chat.completions.create(
+                    **common,
+                    messages=final_messages,
+                    tool_choice="required",
+                )
+            except BadRequestError as final_exc:
+                final_text = str(final_exc)
+                if "parse tool call arguments as JSON" in final_text or "tool_use_failed" in final_text:
+                    raise RuntimeError(
+                        "Groq rejected the model's tool-call arguments after two controlled recovery attempts. "
+                        "No additional tool calls were made and the project was not changed by this failed response."
+                    ) from final_exc
+                raise
+
+
 def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progress_ui) -> str:
     st.session_state.agent_events = []
     st.session_state.agent_step = 0
@@ -489,13 +689,7 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
             elif states["Fix issues"] == "pending": set_stage("Fix issues", "active", "Analyzing failures")
         render_progress(*progress_ui)
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.1,
-        )
+        response = request_agent(client, model, messages)
         message = response.choices[0].message
         assistant: Dict[str, Any] = {"role": "assistant", "content": message.content or ""}
         if message.tool_calls:
@@ -543,8 +737,15 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
 
         for tool_call in message.tool_calls:
             try:
-                args = json.loads(tool_call.function.arguments or "{}")
+                raw_args = tool_call.function.arguments or "{}"
+                if len(raw_args.encode("utf-8")) > 120_000:
+                    raise ValueError("Tool arguments are too large; split the edit into smaller tool calls.")
+                args = json.loads(raw_args)
+                if not isinstance(args, dict):
+                    raise ValueError("Tool arguments must be a JSON object.")
                 result = execute_tool(workspace, tool_call.function.name, args)
+            except json.JSONDecodeError as exc:
+                result = {"ok": False, "fatal_tool_arguments": True, "error": f"Invalid tool-call JSON: {exc}"}
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(result, ensure_ascii=False)})
@@ -627,6 +828,8 @@ if run_clicked:
             st.warning("Development run stopped or completed with unresolved verification issues.")
     except zipfile.BadZipFile:
         st.error("The uploaded file is not a valid ZIP archive.")
+    except RuntimeError as exc:
+        st.error(f"Agent stopped safely: {exc}")
     except Exception as exc:
         st.exception(exc)
 
