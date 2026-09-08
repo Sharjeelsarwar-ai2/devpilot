@@ -92,7 +92,7 @@ def hardened_env(workspace: Path) -> dict:
 
 def start_process(command, workspace: Path, cpu=20, memory_mb=768, file_mb=10):
     env = hardened_env(workspace)
-    return subprocess.Popen(
+    process = subprocess.Popen(
         command,
         cwd=str(workspace),
         env=env,
@@ -100,8 +100,31 @@ def start_process(command, workspace: Path, cpu=20, memory_mb=768, file_mb=10):
         stderr=subprocess.STDOUT,
         text=True,
         start_new_session=True,
-        preexec_fn=(lambda: limits(cpu, memory_mb, file_mb)) if os.name == "posix" else None,
     )
+
+    # Apply limits after process creation. This avoids preexec_fn, which can
+    # fail on hosted runtimes such as Streamlit Cloud.
+    if resource is not None and hasattr(resource, "prlimit"):
+        try:
+            resource.prlimit(process.pid, resource.RLIMIT_CPU, (cpu, cpu))
+        except Exception:
+            pass
+        try:
+            memory = memory_mb * 1024 * 1024
+            resource.prlimit(process.pid, resource.RLIMIT_AS, (memory, memory))
+        except Exception:
+            pass
+        try:
+            size = file_mb * 1024 * 1024
+            resource.prlimit(process.pid, resource.RLIMIT_FSIZE, (size, size))
+        except Exception:
+            pass
+        try:
+            resource.prlimit(process.pid, resource.RLIMIT_NOFILE, (64, 64))
+        except Exception:
+            pass
+
+    return process
 
 
 def tail_output(process: subprocess.Popen, limit=MAX_OUTPUT) -> str:
