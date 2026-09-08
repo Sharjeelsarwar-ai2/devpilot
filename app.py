@@ -267,9 +267,24 @@ def sandbox_call(mode: str, workspace: Path, target: str = "", timeout: int = 20
             },
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"Sandbox runner exceeded its {timeout + 8}s controller timeout."}
+        return {
+            "ok": False,
+            "error": f"Sandbox runner exceeded its {timeout + 8}s controller timeout.",
+            "category": "sandbox_infrastructure",
+            "fatal": True,
+        }
+    except OSError as exc:
+        message = str(exc)
+        if exc.errno == 11 or "resource temporarily unavailable" in message.lower():
+            return {
+                "ok": False,
+                "error": message,
+                "category": "sandbox_infrastructure",
+                "fatal": True,
+            }
+        return {"ok": False, "error": message, "category": "sandbox_infrastructure", "fatal": True}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "category": "sandbox_infrastructure", "fatal": True}
 
     output = (result.stdout or "").strip().splitlines()
     payload = None
@@ -288,7 +303,16 @@ def sandbox_call(mode: str, workspace: Path, target: str = "", timeout: int = 20
     if result.returncode != 0 and payload.get("ok", False):
         payload["ok"] = False
     error_text = str(payload.get("error", ""))
-    if "preexec_fn" in error_text or "permission denied" in error_text.lower() or "operation not permitted" in error_text.lower():
+    infrastructure_markers = (
+        "preexec_fn",
+        "permission denied",
+        "operation not permitted",
+        "resource temporarily unavailable",
+        "[errno 11]",
+        "cannot start process",
+        "no module named streamlit",
+    )
+    if any(marker in error_text.lower() for marker in infrastructure_markers):
         payload["ok"] = False
         payload["category"] = "sandbox_infrastructure"
         payload["fatal"] = True
@@ -427,6 +451,7 @@ def execute_tool(workspace: Path, name: str, args: Dict[str, Any]) -> Dict[str, 
             set_stage("Implement changes", "error", detail)
     elif name in {"run_python", "run_tests", "smoke_test_streamlit"}:
         st.session_state.verification_seen = True
+        st.session_state.verification_attempts = st.session_state.get("verification_attempts", 0) + 1
 
         if name == "smoke_test_streamlit":
             st.session_state.streamlit_verification_required = True
@@ -495,6 +520,7 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
     st.session_state.step_detail = {name: detail for name, detail in DEFAULT_STEPS}
     st.session_state.verification_passed = False
     st.session_state.verification_failed = False
+    st.session_state.verification_attempts = 0
     set_stage("Understand requirement", "active", "Parsing requested change")
     render_progress(*progress_ui)
 
@@ -505,6 +531,15 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
 
     response_text = ""
     for step in range(1, MAX_AGENT_STEPS + 1):
+        if st.session_state.get("verification_blocked"):
+            set_stage("Finalize", "error", "Execution environment blocked verification")
+            st.session_state.run_success = False
+            render_progress(*progress_ui)
+            return (
+                "Development stopped because the sandbox execution environment is unavailable. "
+                "The agent will not modify code to work around an infrastructure failure."
+            )
+
         st.session_state.agent_step = step
         set_stage("Understand requirement", "done", "Requirement loaded")
         states = st.session_state.step_state
@@ -535,6 +570,14 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
         if not message.tool_calls:
             # Do not allow a green final state without successful verification.
             if not st.session_state.verification_passed:
+                if st.session_state.get("verification_attempts", 0) >= 3:
+                    set_stage("Finalize", "error", "Verification failed three times; stopping safely")
+                    st.session_state.run_success = False
+                    render_progress(*progress_ui)
+                    return (
+                        "The agent stopped after three unsuccessful verification attempts. "
+                        "Review the detailed verification diagnostics before retrying."
+                    )
                 messages.append({
                     "role": "user",
                     "content": (
