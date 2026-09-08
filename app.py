@@ -10,9 +10,10 @@ from typing import Any, Dict, List
 import streamlit as st
 from groq import Groq
 try:
-    from groq import BadRequestError
-except ImportError:
+    from groq import BadRequestError, RateLimitError
+except ImportError:  # pragma: no cover
     BadRequestError = Exception
+    RateLimitError = Exception
 
 st.set_page_config(
     page_title="DevPilot AI",
@@ -25,8 +26,11 @@ DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_FILE_BYTES = 300_000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_TOOL_OUTPUT_CHARS = 12_000
-MAX_AGENT_STEPS = 16
+MAX_AGENT_STEPS = 10
 MAX_RECOVERY_ATTEMPTS = 2
+MAX_RATE_LIMIT_RETRIES = 1
+MAX_REPAIR_ATTEMPTS = 2
+MAX_MODEL_OUTPUT_TOKENS = 2200
 MAX_PATCH_TEXT_BYTES = 80_000
 MAX_CREATE_CHUNK_BYTES = 12_000
 GENERATED_TEST_PATH = "tests/test_devpilot_requirements.py"
@@ -519,7 +523,14 @@ def execute_tool(workspace: Path, name: str, args: Dict[str, Any]) -> Dict[str, 
     elif name == "run_python" and result.get("mode") == "compile":
         st.session_state.verification["syntax"] = bool(result.get("ok"))
 
-    if result.get("fatal_infrastructure"):
+    error_text = str(result.get("error", ""))
+    if result.get("fatal_infrastructure") or any(marker in error_text for marker in (
+        "Resource temporarily unavailable",
+        "Exception occurred in preexec_fn",
+        "Sandbox runner returned invalid output",
+        "sandbox_runner.py is missing",
+    )):
+        result["fatal_infrastructure"] = True
         st.session_state.verification["infrastructure_error"] = True
 
     if name == "write_file" and args.get("path") == GENERATED_TEST_PATH and result.get("ok"):
@@ -578,83 +589,106 @@ def render_progress(timeline, progress, status) -> None:
         status.markdown("**Status:** Verification stopped with an issue")
 
 
-def request_agent(client: Groq, model: str, messages: List[Dict[str, Any]], allow_retry: bool = True):
-    """Call Groq with hardened tool-calling retries.
+def _compact_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep recent agent turns small enough for strict TPM budgets.
 
-    Groq validates tool-call JSON before returning a response. If the model emits
-    malformed arguments, our application cannot repair that response after the fact.
-    We therefore retry from the last valid conversation state with progressively
-    stricter instructions, then fail safely instead of looping or mutating files.
+    The project is on disk, so old tool outputs do not need to remain in the
+    entire LLM context: the agent can call read_file/search_file again.
     """
+    if len(messages) <= 12:
+        selected = list(messages)
+    else:
+        prefix = list(messages[:2])  # system + initial user requirement
+        tail = list(messages[-12:])
+        # Start the retained tail at an assistant/user boundary rather than
+        # in the middle of a tool-call exchange whenever possible.
+        boundary = 0
+        for i, msg in enumerate(tail):
+            if msg.get("role") in {"assistant", "user"}:
+                boundary = i
+                break
+        selected = prefix + tail[boundary:]
+
+    compact: List[Dict[str, Any]] = []
+    for i, msg in enumerate(selected):
+        cloned = dict(msg)
+        if isinstance(cloned.get("content"), str):
+            limit = 5000 if i >= max(0, len(selected) - 8) else 1800
+            content = cloned["content"]
+            if len(content) > limit:
+                cloned["content"] = content[:limit] + "\n...[context truncated; re-read if needed]"
+        compact.append(cloned)
+    return compact
+
+
+def _retry_seconds(error_text: str, default: float = 10.0) -> float:
+    import re
+    match = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", error_text, re.IGNORECASE)
+    if not match:
+        return default
+    return min(max(float(match.group(1)), 1.0), 15.0)
+
+
+def request_agent(client: Groq, model: str, messages: List[Dict[str, Any]], allow_retry: bool = True):
+    """Call Groq with bounded output, compact context and controlled retries."""
     common = {
         "model": model,
-        "messages": messages,
+        "messages": _compact_messages(messages),
         "tools": TOOLS,
         "parallel_tool_calls": False,
         "temperature": 0,
+        "max_tokens": MAX_MODEL_OUTPUT_TOKENS,
     }
 
+    # Rate-limit recovery: wait once using Groq's advertised delay.
+    for rate_attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            return client.chat.completions.create(**common, tool_choice="auto")
+        except RateLimitError as exc:
+            if rate_attempt >= MAX_RATE_LIMIT_RETRIES:
+                raise RuntimeError(
+                    "Groq token rate limit remained exceeded after one controlled retry. "
+                    "The agent stopped safely. Reduce request context or wait before running again."
+                ) from exc
+            import time
+            wait_for = _retry_seconds(str(exc))
+            st.warning(f"Groq rate limit reached. Retrying once in {wait_for:.1f}s...")
+            time.sleep(wait_for)
+
+    raise RuntimeError("Groq request could not be completed.")
+
+
+def _is_malformed_tool_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "parse tool call arguments as JSON" in text or "tool_use_failed" in text
+
+
+def request_agent_with_tool_recovery(client: Groq, model: str, messages: List[Dict[str, Any]]):
+    """Retry provider-side malformed tool calls without entering a repair loop."""
     try:
-        return client.chat.completions.create(
-            **common,
-            tool_choice="auto",
-        )
+        return request_agent(client, model, messages)
     except BadRequestError as exc:
-        text = str(exc)
-        malformed = "parse tool call arguments as JSON" in text or "tool_use_failed" in text
-        if not (allow_retry and malformed):
+        if not _is_malformed_tool_error(exc):
             raise
 
-        # Retry #1: force exactly one tool call and prohibit large/free-form edits.
-        retry_messages = list(messages)
-        retry_messages.append({
+        recovery_messages = list(messages) + [{
             "role": "user",
             "content": (
-                "TOOL-CALL RECOVERY. The previous tool arguments were rejected as invalid JSON. "
-                "Do not repeat the rejected call verbatim. Use exactly ONE tool call. "
-                "For existing files, use apply_patch with a small exact old_text/new_text block. "
-                "For new files, use create_file or append_file in small chunks. "
-                "Keep each content string short. Escape backslashes and quotes as valid JSON. "
-                "Never add duplicate fields, markdown fences, or dependency-shadowing files."
+                "TOOL FORMAT RECOVERY. Your previous tool arguments were invalid JSON. "
+                "Make exactly ONE small tool call. Existing files: use apply_patch with a small exact block. "
+                "New files: use create_file or append_file in chunks <= 12000 bytes. "
+                "Return only schema-valid JSON arguments; do not use markdown fences or duplicate fields."
             ),
-        })
+        }]
         try:
-            return client.chat.completions.create(
-                **common,
-                messages=retry_messages,
-                tool_choice="required",
-            )
+            return request_agent(client, model, recovery_messages)
         except BadRequestError as retry_exc:
-            retry_text = str(retry_exc)
-            if not ("parse tool call arguments as JSON" in retry_text or "tool_use_failed" in retry_text):
+            if not _is_malformed_tool_error(retry_exc):
                 raise
-
-            # Retry #2 uses an even more constrained edit instruction. If this fails,
-            # stop safely. Never enter an LLM repair loop for a provider serialization error.
-            final_messages = list(messages)
-            final_messages.append({
-                "role": "user",
-                "content": (
-                    "FINAL TOOL FORMAT RECOVERY. Return one small valid tool call only. "
-                    "Do not rewrite whole files. Prefer apply_patch. "
-                    "The JSON arguments must contain only the schema fields and valid escaped JSON strings. "
-                    "If the requested edit is large, split it into multiple tool calls."
-                ),
-            })
-            try:
-                return client.chat.completions.create(
-                    **common,
-                    messages=final_messages,
-                    tool_choice="required",
-                )
-            except BadRequestError as final_exc:
-                final_text = str(final_exc)
-                if "parse tool call arguments as JSON" in final_text or "tool_use_failed" in final_text:
-                    raise RuntimeError(
-                        "Groq rejected the model's tool-call arguments after two controlled recovery attempts. "
-                        "No additional tool calls were made and the project was not changed by this failed response."
-                    ) from final_exc
-                raise
+            raise RuntimeError(
+                "Groq rejected the model's tool-call JSON after controlled recovery. "
+                "The agent stopped safely without applying another edit from the rejected response."
+            ) from retry_exc
 
 
 def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progress_ui) -> str:
@@ -676,6 +710,7 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
         )},
     ]
 
+    repair_attempts = 0
     for step in range(1, MAX_AGENT_STEPS + 1):
         st.session_state.agent_step = step
         set_stage("Understand requirement", "done", "Requirement loaded")
@@ -689,7 +724,7 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
             elif states["Fix issues"] == "pending": set_stage("Fix issues", "active", "Analyzing failures")
         render_progress(*progress_ui)
 
-        response = request_agent(client, model, messages)
+        response = request_agent_with_tool_recovery(client, model, messages)
         message = response.choices[0].message
         assistant: Dict[str, Any] = {"role": "assistant", "content": message.content or ""}
         if message.tool_calls:
@@ -716,12 +751,19 @@ def run_agent(workspace: Path, requirement: str, client: Groq, model: str, progr
                 # Do not allow a natural-language final response to bypass verification.
                 set_stage("Run verification", "error", "Required verification did not pass")
                 set_stage("Fix issues", "active", "Required tests or smoke test are still failing")
+                if repair_attempts >= MAX_REPAIR_ATTEMPTS:
+                    set_stage("Fix issues", "error", "Maximum repair attempts reached")
+                    set_stage("Finalize", "error", "Required verification still failing")
+                    render_progress(*progress_ui)
+                    return "Development stopped because required verification remained unsuccessful after the maximum repair attempts."
+                repair_attempts += 1
                 messages.append({
                     "role": "user",
                     "content": (
                         "Do not finalize yet. Verification is incomplete. "
                         f"Requirement tests generated={tests_present}, pytest_passed={tests_ok}, smoke_passed={smoke_ok}. "
-                        "Continue by generating/fixing the requirement tests, running them, and running smoke_test_streamlit."
+                        "Continue by generating/fixing the requirement tests, running them, and running smoke_test_streamlit. "
+                        f"This is repair attempt {repair_attempts}/{MAX_REPAIR_ATTEMPTS}."
                     ),
                 })
                 render_progress(*progress_ui)
