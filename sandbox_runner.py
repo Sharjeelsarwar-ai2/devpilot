@@ -70,13 +70,11 @@ def cleanup_process(proc: subprocess.Popen) -> None:
 
 
 def run_command(command, workspace: Path, timeout: int):
-    preexec = None
-    if os.name == "posix":
-        def _limits():
-            os.setsid()
-            apply_limits(cpu_seconds=max(8, timeout - 2))
-        preexec = _limits
-
+    # Do not use preexec_fn here. Streamlit Cloud can fail when a preexec
+    # callback raises inside the child. Resource limits are applied to the
+    # runner process before this function is called, and are inherited by
+    # child processes. start_new_session gives us a clean process group for
+    # reliable cleanup without calling os.setsid() twice.
     try:
         proc = subprocess.Popen(
             command,
@@ -86,7 +84,6 @@ def run_command(command, workspace: Path, timeout: int):
             text=True,
             env=scrubbed_env(workspace),
             start_new_session=(os.name == "posix"),
-            preexec_fn=preexec if os.name == "posix" else None,
         )
     except Exception as exc:
         return {"ok": False, "returncode": -1, "error": str(exc)}
@@ -108,7 +105,6 @@ def run_command(command, workspace: Path, timeout: int):
         }
     finally:
         cleanup_process(proc)
-
 
 def compile_file(workspace: Path, target: str, timeout: int):
     path = (workspace / target).resolve()
@@ -178,13 +174,6 @@ def run_streamlit(workspace: Path, target: str, timeout: int):
         "--server.fileWatcherType=none",
     ]
 
-    preexec = None
-    if os.name == "posix":
-        def _limits():
-            os.setsid()
-            apply_limits(cpu_seconds=max(10, timeout - 2), max_file_bytes=8 * 1024 * 1024)
-        preexec = _limits
-
     try:
         proc = subprocess.Popen(
             command,
@@ -194,29 +183,33 @@ def run_streamlit(workspace: Path, target: str, timeout: int):
             text=True,
             env=scrubbed_env(workspace),
             start_new_session=(os.name == "posix"),
-            preexec_fn=preexec if os.name == "posix" else None,
         )
     except Exception as exc:
-        return {"ok": False, "returncode": -1, "error": str(exc), "mode": "sandbox_streamlit_smoke"}
+        return {
+            "ok": False,
+            "returncode": -1,
+            "error": str(exc),
+            "mode": "sandbox_streamlit_smoke",
+        }
 
     deadline = time.monotonic() + timeout
-    status = None
     try:
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 stdout, stderr = proc.communicate(timeout=2)
+                combined = (stdout + "\n" + stderr).strip()
                 return {
                     "ok": False,
                     "mode": "sandbox_streamlit_smoke",
                     "returncode": proc.returncode,
                     "error": "Streamlit exited before its HTTP server became ready.",
-                    "startup_log": (stdout + "\n" + stderr)[-MAX_OUTPUT:],
+                    "startup_log": combined[-MAX_OUTPUT:],
                     "hint": (
-                        "The sandbox uses the same Python interpreter as the main app. "
-                        "If this says 'No module named streamlit', add streamlit to the "
-                        "main deployment requirements."
+                        "The smoke test uses the same Python interpreter as the main app. "
+                        "Ensure Streamlit is installed in the deployment requirements."
                     ),
                 }
+
             status = http_ok(f"http://127.0.0.1:{port}/")
             if status is not None:
                 return {
@@ -239,7 +232,6 @@ def run_streamlit(workspace: Path, target: str, timeout: int):
     finally:
         cleanup_process(proc)
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True, choices=["python", "compile", "pytest", "streamlit"])
@@ -250,6 +242,10 @@ def main():
 
     workspace = Path(args.workspace).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
+
+    # Apply limits in the runner itself so they are inherited by child
+    # processes. This avoids the fragile preexec_fn mechanism.
+    apply_limits(cpu_seconds=max(8, args.timeout - 2), max_file_bytes=8 * 1024 * 1024)
 
     if args.mode == "compile":
         result = compile_file(workspace, args.target, args.timeout)
