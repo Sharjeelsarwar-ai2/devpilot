@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import json
 import os
@@ -5,6 +6,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -12,262 +14,282 @@ from pathlib import Path
 
 try:
     import resource
-except ImportError:
+except ImportError:  # pragma: no cover
     resource = None
 
 MAX_OUTPUT = 12000
-DEFAULT_TIMEOUT = 20
 
 
-def scrubbed_env(workspace: Path) -> dict:
-    # Do not pass application/API secrets to uploaded code.
-    allowed = {}
-    for key in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT"):
-        if key in os.environ:
-            allowed[key] = os.environ[key]
-    allowed["PYTHONUNBUFFERED"] = "1"
-    allowed["PYTHONNOUSERSITE"] = "1"
-    allowed["DEV_PILOT_WORKSPACE"] = str(workspace)
-    return allowed
+def safe_path(workspace: Path, relative: str) -> Path:
+    root = workspace.resolve()
+    target = (workspace / relative).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("Target path escapes the sandbox workspace.")
+    return target
 
 
-def apply_limits(cpu_seconds: int = 60, max_file_bytes: int = 8 * 1024 * 1024):
+def limits(cpu_seconds: int, memory_mb: int, file_mb: int):
     if resource is None:
         return
-
-    # Do NOT set RLIMIT_NPROC here. On hosted Linux environments such as
-    # Streamlit Cloud, process/thread limits are shared at the user level.
-    # A low per-process RLIMIT_NPROC can make subprocess creation fail with
-    # [Errno 11] Resource temporarily unavailable, including when Streamlit
-    # starts its own runtime threads/processes. Wall-clock timeouts below are
-    # the primary execution bound.
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
     except Exception:
         pass
     try:
-        resource.setrlimit(resource.RLIMIT_FSIZE, (max_file_bytes, max_file_bytes))
+        memory = memory_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+    except Exception:
+        pass
+    try:
+        size = file_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_FSIZE, (size, size))
+    except Exception:
+        pass
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
     except Exception:
         pass
 
 
-def cleanup_process(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
+def kill_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
         return
     try:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGTERM)
-        else:
-            proc.terminate()
-        proc.wait(timeout=3)
+        os.killpg(process.pid, signal.SIGTERM)
+        time.sleep(0.5)
     except Exception:
         try:
-            if os.name == "posix":
-                os.killpg(proc.pid, signal.SIGKILL)
-            else:
-                proc.kill()
-            proc.wait(timeout=2)
+            process.terminate()
         except Exception:
             pass
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
 
 
-def run_command(command, workspace: Path, timeout: int):
-    # Do not use preexec_fn here. Streamlit Cloud can fail when a preexec
-    # callback raises inside the child. Resource limits are applied to the
-    # runner process before this function is called, and are inherited by
-    # child processes. start_new_session gives us a clean process group for
-    # reliable cleanup without calling os.setsid() twice.
+def hardened_env(workspace: Path) -> dict:
+    # Give the child a minimal, non-secret environment.
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "HOME": str(workspace / ".sandbox_home"),
+        "TMPDIR": str(workspace / ".sandbox_tmp"),
+    }
+    Path(env["HOME"]).mkdir(exist_ok=True)
+    Path(env["TMPDIR"]).mkdir(exist_ok=True)
+    # Do not expose common LLM/cloud credentials or Streamlit secrets.
+    return env
+
+
+def start_process(command, workspace: Path, cpu=20, memory_mb=768, file_mb=10):
+    env = hardened_env(workspace)
+    return subprocess.Popen(
+        command,
+        cwd=str(workspace),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+        preexec_fn=(lambda: limits(cpu, memory_mb, file_mb)) if os.name == "posix" else None,
+    )
+
+
+def tail_output(process: subprocess.Popen, limit=MAX_OUTPUT) -> str:
     try:
-        proc = subprocess.Popen(
-            command,
-            cwd=str(workspace),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=scrubbed_env(workspace),
-            start_new_session=(os.name == "posix"),
-        )
-    except Exception as exc:
-        return {"ok": False, "returncode": -1, "error": str(exc), "category": "sandbox_infrastructure", "fatal": True}
+        output, _ = process.communicate(timeout=1)
+        return (output or "")[-limit:]
+    except Exception:
+        return ""
 
+
+def run_python(workspace: Path, target: Path, timeout: int):
+    process = None
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        process = start_process([sys.executable, "-I", str(target)], workspace)
+        output, _ = process.communicate(timeout=timeout)
         return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": stdout[-MAX_OUTPUT:],
-            "stderr": stderr[-MAX_OUTPUT:],
+            "ok": process.returncode == 0,
+            "mode": "sandbox_python",
+            "returncode": process.returncode,
+            "output": (output or "")[-MAX_OUTPUT:],
         }
     except subprocess.TimeoutExpired:
-        cleanup_process(proc)
+        if process:
+            kill_process_tree(process)
+        return {"ok": False, "mode": "sandbox_python", "error": f"Timed out after {timeout}s."}
+    except Exception as exc:
+        if process:
+            kill_process_tree(process)
+        return {"ok": False, "mode": "sandbox_python", "error": str(exc)}
+
+
+def compile_python(workspace: Path, target: Path, timeout: int):
+    process = None
+    try:
+        process = start_process(
+            [sys.executable, "-I", "-m", "py_compile", str(target)],
+            workspace,
+            cpu=10,
+            memory_mb=512,
+            file_mb=5,
+        )
+        output, _ = process.communicate(timeout=timeout)
         return {
-            "ok": False,
-            "returncode": -9,
-            "error": f"Process exceeded the {timeout}s timeout and was terminated.",
+            "ok": process.returncode == 0,
+            "mode": "sandbox_py_compile",
+            "returncode": process.returncode,
+            "output": (output or "")[-MAX_OUTPUT:],
         }
-    finally:
-        cleanup_process(proc)
-
-def compile_file(workspace: Path, target: str, timeout: int):
-    path = (workspace / target).resolve()
-    root = workspace.resolve()
-    if path != root and root not in path.parents:
-        return {"ok": False, "error": "Target escapes workspace."}
-    if not path.exists() or path.suffix != ".py":
-        return {"ok": False, "error": f"Python file not found: {target}"}
-    result = run_command([sys.executable, "-m", "py_compile", str(path)], workspace, timeout)
-    result["mode"] = "compile"
-    return result
-
-
-def run_python(workspace: Path, target: str, timeout: int):
-    path = (workspace / target).resolve()
-    root = workspace.resolve()
-    if path != root and root not in path.parents:
-        return {"ok": False, "error": "Target escapes workspace."}
-    if not path.exists() or path.suffix != ".py":
-        return {"ok": False, "error": f"Python file not found: {target}"}
-    result = run_command([sys.executable, str(path)], workspace, timeout)
-    result["mode"] = "python"
-    return result
+    except subprocess.TimeoutExpired:
+        if process:
+            kill_process_tree(process)
+        return {"ok": False, "mode": "sandbox_py_compile", "error": f"Timed out after {timeout}s."}
+    except Exception as exc:
+        if process:
+            kill_process_tree(process)
+        return {"ok": False, "mode": "sandbox_py_compile", "error": str(exc)}
 
 
 def run_pytest(workspace: Path, timeout: int):
-    result = run_command([sys.executable, "-m", "pytest", "-q"], workspace, timeout)
-    result["mode"] = "pytest"
-    return result
+    process = None
+    try:
+        process = start_process(
+            [sys.executable, "-I", "-m", "pytest", "-q"],
+            workspace,
+            cpu=30,
+            memory_mb=768,
+            file_mb=15,
+        )
+        output, _ = process.communicate(timeout=timeout)
+        return {
+            "ok": process.returncode == 0,
+            "mode": "sandbox_pytest",
+            "returncode": process.returncode,
+            "output": (output or "")[-MAX_OUTPUT:],
+        }
+    except subprocess.TimeoutExpired:
+        if process:
+            kill_process_tree(process)
+        return {"ok": False, "mode": "sandbox_pytest", "error": f"Timed out after {timeout}s."}
+    except Exception as exc:
+        if process:
+            kill_process_tree(process)
+        return {"ok": False, "mode": "sandbox_pytest", "error": str(exc)}
 
 
-def free_port() -> int:
+def find_free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def http_ok(url: str) -> int | None:
     try:
-        with urllib.request.urlopen(url, timeout=1.5) as response:
-            return response.status
-    except Exception:
-        return None
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
 
 
-def run_streamlit(workspace: Path, target: str, timeout: int):
-    port = free_port()
-    entry = (workspace / target).resolve()
-    root = workspace.resolve()
-    if entry != root and root not in entry.parents:
-        return {"ok": False, "error": "Target escapes workspace."}
-    if not entry.exists() or entry.suffix != ".py":
-        return {"ok": False, "error": f"Streamlit entry file not found: {target}"}
-
+def smoke_streamlit(workspace: Path, target: Path, timeout: int):
+    port = find_free_port()
     command = [
         sys.executable,
+        "-I",
         "-m",
         "streamlit",
         "run",
-        str(entry),
-        "--server.headless=true",
-        "--server.address=127.0.0.1",
-        f"--server.port={port}",
-        "--browser.gatherUsageStats=false",
-        "--server.fileWatcherType=none",
+        str(target),
+        "--server.address",
+        "127.0.0.1",
+        "--server.port",
+        str(port),
+        "--server.headless",
+        "true",
+        "--server.fileWatcherType",
+        "none",
+        "--browser.gatherUsageStats",
+        "false",
     ]
-
+    process = None
+    start = time.time()
     try:
-        proc = subprocess.Popen(
-            command,
-            cwd=str(workspace),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=scrubbed_env(workspace),
-            start_new_session=(os.name == "posix"),
-        )
-    except Exception as exc:
-        return {
-            "ok": False,
-            "returncode": -1,
-            "error": str(exc),
-            "mode": "sandbox_streamlit_smoke",
-            "category": "sandbox_infrastructure",
-            "fatal": True,
-        }
+        process = start_process(command, workspace, cpu=30, memory_mb=768, file_mb=20)
+        deadline = start + timeout
+        url = f"http://127.0.0.1:{port}/"
 
-    deadline = time.monotonic() + timeout
-    try:
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                stdout, stderr = proc.communicate(timeout=2)
-                combined = (stdout + "\n" + stderr).strip()
-                payload = {
+        while time.time() < deadline:
+            if process.poll() is not None:
+                output = tail_output(process)
+                return {
                     "ok": False,
                     "mode": "sandbox_streamlit_smoke",
-                    "returncode": proc.returncode,
+                    "returncode": process.returncode,
                     "error": "Streamlit exited before its HTTP server became ready.",
-                    "startup_log": combined[-MAX_OUTPUT:],
-                    "hint": (
-                        "The smoke test uses the same Python interpreter as the main app. "
-                        "Ensure Streamlit is installed in the deployment requirements."
-                    ),
+                    "startup_log": output,
                 }
-                if "No module named streamlit" in combined:
-                    payload["category"] = "sandbox_infrastructure"
-                    payload["fatal"] = True
-                    payload["error"] = "The deployment Python environment cannot import Streamlit."
-                return payload
+            try:
+                with urllib.request.urlopen(url, timeout=1) as response:
+                    body = response.read(2000).decode("utf-8", errors="ignore")
+                    return {
+                        "ok": 200 <= response.status < 400,
+                        "mode": "sandbox_streamlit_smoke",
+                        "status_code": response.status,
+                        "startup_seconds": round(time.time() - start, 2),
+                        "contains_streamlit": "streamlit" in body.lower(),
+                        "message": "Streamlit started and returned an HTTP response inside the sandbox runner.",
+                    }
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                time.sleep(0.3)
 
-            status = http_ok(f"http://127.0.0.1:{port}/")
-            if status is not None:
-                return {
-                    "ok": status == 200,
-                    "mode": "sandbox_streamlit_smoke",
-                    "returncode": None,
-                    "http_status": status,
-                    "message": "Streamlit HTTP server responded successfully.",
-                }
-            time.sleep(0.35)
-
-        stdout, stderr = proc.communicate(timeout=2)
         return {
             "ok": False,
             "mode": "sandbox_streamlit_smoke",
-            "returncode": proc.returncode,
-            "error": "Streamlit HTTP server did not become ready before the timeout.",
-            "startup_log": (stdout + "\n" + stderr)[-MAX_OUTPUT:],
+            "error": f"Timed out after {timeout}s waiting for HTTP response.",
+            "startup_log": tail_output(process),
         }
     finally:
-        cleanup_process(proc)
+        if process:
+            kill_process_tree(process)
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True, choices=["python", "compile", "pytest", "streamlit"])
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--target", default="")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--timeout", type=int, default=20)
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
-    workspace.mkdir(parents=True, exist_ok=True)
+    if not workspace.is_dir():
+        raise ValueError("Sandbox workspace does not exist.")
 
-    # Apply limits in the runner itself so they are inherited by child
-    # processes. This avoids the fragile preexec_fn mechanism.
-    apply_limits(cpu_seconds=max(60, args.timeout + 30), max_file_bytes=8 * 1024 * 1024)
+    if args.mode in {"python", "compile", "streamlit"}:
+        target = safe_path(workspace, args.target)
+        if not target.is_file():
+            raise ValueError("Target file does not exist.")
 
-    if args.mode == "compile":
-        result = compile_file(workspace, args.target, args.timeout)
-    elif args.mode == "python":
-        result = run_python(workspace, args.target, args.timeout)
+    if args.mode == "python":
+        result = run_python(workspace, target, args.timeout)
+    elif args.mode == "compile":
+        result = compile_python(workspace, target, args.timeout)
     elif args.mode == "pytest":
         result = run_pytest(workspace, args.timeout)
     else:
-        result = run_streamlit(workspace, args.target, args.timeout)
+        result = smoke_streamlit(workspace, target, args.timeout)
 
     print(json.dumps(result, ensure_ascii=False))
-    raise SystemExit(0 if result.get("ok") else 1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        sys.exit(1)
