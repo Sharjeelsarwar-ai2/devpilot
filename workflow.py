@@ -300,161 +300,123 @@ class WorkflowEngine:
 
         return normalized
 
-   def apply_edits(
-    self,
-    workspace: Path,
-    edits: list[dict[str, str]],
-) -> dict[str, Any]:
-    changed = []
-    originals: dict[Path, str | None] = {}
+    def apply_edits(
+        self,
+        workspace: Path,
+        edits: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        changed = []
+        originals: dict[Path, str | None] = {}
 
-    def find_normalized_match(current: str, search: str):
-        """
-        Find a search block while tolerating whitespace/indentation differences.
-        Returns (start, end) in the normalized source text.
-        """
-        current_normalized = current.replace("\r\n", "\n").replace("\r", "\n")
-        search_normalized = search.replace("\r\n", "\n").replace("\r", "\n")
+        def find_normalized_match(current: str, search: str):
+            current_normalized = current.replace("\r\n", "\n").replace("\r", "\n")
+            search_normalized = search.replace("\r\n", "\n").replace("\r", "\n")
 
-        if search_normalized in current_normalized:
-            start = current_normalized.index(search_normalized)
-            return start, start + len(search_normalized)
+            if search_normalized in current_normalized:
+                start = current_normalized.index(search_normalized)
+                return start, start + len(search_normalized)
 
-        current_lines = current_normalized.split("\n")
-        search_lines = search_normalized.split("\n")
+            current_lines = current_normalized.split("\n")
+            search_lines = search_normalized.split("\n")
 
-        while search_lines and not search_lines[0].strip():
-            search_lines.pop(0)
+            while search_lines and not search_lines[0].strip():
+                search_lines.pop(0)
+            while search_lines and not search_lines[-1].strip():
+                search_lines.pop()
 
-        while search_lines and not search_lines[-1].strip():
-            search_lines.pop()
+            if not search_lines:
+                return None
 
-        if not search_lines:
+            wanted = [line.strip() for line in search_lines]
+
+            for i in range(len(current_lines) - len(search_lines) + 1):
+                candidate = [line.strip() for line in current_lines[i:i + len(search_lines)]]
+                if candidate == wanted:
+                    start = sum(len(line) + 1 for line in current_lines[:i])
+                    end = sum(len(line) + 1 for line in current_lines[:i + len(search_lines)])
+                    if end > start and current_normalized.endswith("\n"):
+                        end -= 1
+                    return start, end
+
             return None
 
-        wanted = [line.strip() for line in search_lines]
+        for edit in edits:
+            target = self.safe_path(workspace, edit["path"])
 
-        for i in range(len(current_lines) - len(search_lines) + 1):
-            candidate = [
-                line.strip()
-                for line in current_lines[i:i + len(search_lines)]
-            ]
-
-            if candidate == wanted:
-                start = sum(len(line) + 1 for line in current_lines[:i])
-                end = sum(
-                    len(line) + 1
-                    for line in current_lines[:i + len(search_lines)]
-                )
-
-                if end > start and current_normalized.endswith("\n"):
-                    end -= 1
-
-                return start, end
-
-        return None
-
-    for edit in edits:
-        target = self.safe_path(workspace, edit["path"])
-
-        blocked_names = {
-            "streamlit.py",
-            "groq.py",
-            "pytest.py",
-            "subprocess.py",
-            "os.py",
-            "json.py",
-        }
-
-        if target.name in blocked_names:
-            continue
-
-        if "secrets" in target.parts or target.name in {
-            ".env",
-            "secrets.toml",
-        }:
-            continue
-
-        if target.exists():
-            current = self.read_text(workspace, edit["path"])
-
-            if edit["search"] in current:
-                updated = current.replace(
-                    edit["search"],
-                    edit["replace"],
-                    1,
-                )
-            else:
-                match = find_normalized_match(
-                    current,
-                    edit["search"],
-                )
-
-                if match is None:
-                    continue
-
-                start, end = match
-                normalized_current = (
-                    current
-                    .replace("\r\n", "\n")
-                    .replace("\r", "\n")
-                )
-
-                updated = (
-                    normalized_current[:start]
-                    + edit["replace"]
-                    + normalized_current[end:]
-                )
-        else:
-            originals.setdefault(target, None)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            updated = edit["replace"]
-
-        if target not in originals:
-            originals[target] = current if target.exists() else None
-
-        if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
-            continue
-
-        target.write_text(updated, encoding="utf-8")
-
-        if edit["path"] not in changed:
-            changed.append(edit["path"])
-
-    # Roll back edits if they introduce Python syntax errors.
-    if changed:
-        compile_result = self.compile_project(workspace)
-
-        if not compile_result["ok"]:
-            for target, original in originals.items():
-                if original is None:
-                    try:
-                        target.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                else:
-                    target.write_text(
-                        original,
-                        encoding="utf-8",
-                    )
-
-            return {
-                "ok": False,
-                "changed_files": [],
-                "count": 0,
-                "rolled_back": True,
-                "error": (
-                    "Edits were rolled back because they introduced "
-                    "a Python syntax error."
-                ),
-                "compile": compile_result,
+            blocked_names = {
+                "streamlit.py",
+                "groq.py",
+                "pytest.py",
+                "subprocess.py",
+                "os.py",
+                "json.py",
             }
 
-    return {
-        "ok": True,
-        "changed_files": changed,
-        "count": len(changed),
-    }
+            if target.name in blocked_names:
+                continue
+
+            if "secrets" in target.parts or target.name in {".env", "secrets.toml"}:
+                continue
+
+            if target.exists():
+                current = self.read_text(workspace, edit["path"])
+
+                if edit["search"] in current:
+                    updated = current.replace(edit["search"], edit["replace"], 1)
+                else:
+                    match = find_normalized_match(current, edit["search"])
+                    if match is None:
+                        continue
+
+                    start, end = match
+                    normalized_current = current.replace("\r\n", "\n").replace("\r", "\n")
+                    updated = normalized_current[:start] + edit["replace"] + normalized_current[end:]
+            else:
+                originals.setdefault(target, None)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                updated = edit["replace"]
+
+            if target not in originals:
+                originals[target] = current if target.exists() else None
+
+            if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
+                continue
+
+            target.write_text(updated, encoding="utf-8")
+
+            if edit["path"] not in changed:
+                changed.append(edit["path"])
+
+        if changed:
+            compile_result = self.compile_project(workspace)
+
+            if not compile_result["ok"]:
+                for target, original in originals.items():
+                    if original is None:
+                        try:
+                            target.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    else:
+                        target.write_text(original, encoding="utf-8")
+
+                return {
+                    "ok": False,
+                    "changed_files": [],
+                    "count": 0,
+                    "rolled_back": True,
+                    "error": (
+                        "Edits were rolled back because they introduced "
+                        "a Python syntax error."
+                    ),
+                    "compile": compile_result,
+                }
+
+        return {
+            "ok": True,
+            "changed_files": changed,
+            "count": len(changed),
+        }
     # -------------------------
     # Deterministic verification
     # -------------------------
@@ -644,6 +606,84 @@ class WorkflowEngine:
         try:
             state.workspace = self.extract(uploaded_file)
 
+            # 1. Requirements
+            self.update(state, "requirements", "active", "Extracting acceptance criteria")
+            criteria = self.llm_json(
+                """
+You are the requirements analyst.
+Turn the user request into explicit, testable acceptance criteria.
+Return JSON only:
+{
+  "criteria": ["criterion 1", "criterion 2"]
+}
+""",
+                f"Requirement:\n{requirement[:5000]}",
+                state,
+            )
+            state.verification["requirements"] = criteria
+            self.event(state, "Requirements extracted", True, criteria)
+            self.update(state, "requirements", "done", "Acceptance criteria extracted")
+
+            # 2. Inspection
+            self.update(state, "inspection", "active", "Inspecting project structure")
+            project_files = self.project_map(state.workspace)
+            inspection = self.llm_json(
+                """
+You are the project-inspection specialist.
+Inspect the supplied project file list and identify the relevant files and entry point.
+Return JSON only:
+{
+  "relevant_files": ["app.py"],
+  "entry_point": "app.py",
+  "notes": "brief"
+}
+Rules:
+- Only use files present in the supplied file list.
+- For Streamlit projects, prefer the main Streamlit .py file as entry_point.
+""",
+                f"Requirement:\n{requirement[:5000]}\n\nFiles:\n{json.dumps(project_files)[:MAX_CONTEXT_CHARS]}",
+                state,
+            )
+            relevant = inspection.get("relevant_files", [])
+            if not isinstance(relevant, list):
+                relevant = []
+            relevant = [str(x) for x in relevant if isinstance(x, str)]
+
+            if not relevant:
+                relevant = [row["path"] for row in project_files if row["path"].endswith((".py", ".js", ".ts", ".cs"))][:8]
+
+            snippets = []
+            for path in relevant[:8]:
+                try:
+                    snippets.append(f"FILE: {path}\n{self.read_text(state.workspace, path)[:5000]}")
+                except Exception:
+                    continue
+
+            entry_point = inspection.get("entry_point")
+            if not isinstance(entry_point, str) or not entry_point:
+                entry_point = "app.py" if (state.workspace / "app.py").exists() else None
+            inspection["relevant_files"] = relevant
+            inspection["entry_point"] = entry_point
+            state.verification["inspection"] = inspection
+            self.event(state, "Project inspected", True, inspection)
+            self.update(state, "inspection", "done", f"Relevant files: {len(relevant)}")
+
+            # 3. Design
+            self.update(state, "design", "active", "Planning minimal solution")
+            design = self.llm_json(
+                """
+You are the solution-design specialist.
+Create a minimal implementation plan based only on the requirement and inspected code.
+Return JSON only:
+{
+  "plan": ["step 1", "step 2"],
+  "target_files": ["app.py"],
+  "notes": "brief"
+}
+""",
+                f"Requirement:\n{requirement[:5000]}\n\nInspection:\n{json.dumps(inspection)[:6000]}\n\nCurrent code:\n{chr(10).join(snippets)[:MAX_CONTEXT_CHARS]}",
+                state,
+            )
             state.verification["design"] = design
             self.event(state, "Solution designed", True, design)
             self.update(state, "design", "done", "Minimal implementation plan prepared")
@@ -663,11 +703,11 @@ Return JSON only:
 }
 Rules:
 - Maximum 3 edits.
-- search must be copied exactly from the supplied code.
+- search must be copied from the supplied code.
 - Do not invent missing text.
 - Never modify secret files.
 - Do not create dependency-shadowing files such as streamlit.py, groq.py, pytest.py.
-- Keep each edit small.
+- Keep each edit small and preserve valid indentation.
 """,
                 f"Requirement:\n{requirement[:5000]}\n\nPlan:\n{json.dumps(design)[:6000]}\n\nCode:\n{chr(10).join(snippets)[:MAX_CONTEXT_CHARS]}",
                 state,
@@ -677,11 +717,7 @@ Rules:
             applied = self.apply_edits(state.workspace, edits)
 
             if not applied["changed_files"]:
-                self.fail(
-                    state,
-                    "Implementation produced no valid matching edits.",
-                    "implementation",
-                )
+                self.fail(state, "Implementation produced no valid matching edits.", "implementation")
                 return self._finish(state)
 
             self.event(state, "Implementation applied", True, applied)
@@ -692,15 +728,17 @@ Rules:
             test_plan = self.llm_json(
                 """
 You are the test-generation specialist.
-Return JSON:
+Return JSON only:
 {
   "test_file": "tests/test_requirement.py",
   "tests": [
     {"name":"test_name","code":"small pytest test"}
   ]
 }
-Prefer pure-Python tests. For Streamlit, use streamlit.testing.v1.AppTest only when clearly appropriate.
-Keep tests small and deterministic. Do not add dependencies.
+Rules:
+- Keep tests small and deterministic.
+- Prefer pure-Python tests.
+- Do not add dependencies.
 """,
                 f"Requirement:\n{requirement[:5000]}\n\nCurrent relevant code:\n{chr(10).join(snippets)[:MAX_CONTEXT_CHARS]}",
                 state,
@@ -708,7 +746,6 @@ Keep tests small and deterministic. Do not add dependencies.
 
             test_file = str(test_plan.get("test_file", "tests/test_requirement.py"))
             tests = test_plan.get("tests", [])
-
             if isinstance(tests, list) and tests:
                 test_code = "import pytest\n\n"
                 for item in tests[:4]:
@@ -723,32 +760,22 @@ Keep tests small and deterministic. Do not add dependencies.
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(test_code, encoding="utf-8")
                     state.verification["test_file"] = test_file
-                    self.event(
-                        state,
-                        "Requirement tests generated",
-                        True,
-                        {"test_file": test_file, "count": len(tests)},
-                    )
+                    self.event(state, "Requirement tests generated", True, {"test_file": test_file})
 
             self.update(state, "test_generation", "done", "Focused tests prepared")
 
-            # 6-9 verification loop
+            # 6-8 Verification / failure analysis / repair loop
             for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
                 self.update(state, "testing", "active", "Running compile and tests")
-
                 compile_result = self.compile_project(state.workspace)
                 pytest_result = self.run_pytest(state.workspace)
-
                 testing_ok = compile_result["ok"] and pytest_result["ok"]
 
                 self.event(
                     state,
                     f"Testing attempt {attempt + 1}",
                     testing_ok,
-                    {
-                        "compile": compile_result,
-                        "pytest": pytest_result,
-                    },
+                    {"compile": compile_result, "pytest": pytest_result},
                 )
 
                 if testing_ok:
@@ -758,19 +785,14 @@ Keep tests small and deterministic. Do not add dependencies.
                     break
 
                 self.update(state, "testing", "error", "Verification tests failed")
-
                 self.update(state, "failure_analysis", "active", "Classifying test failure")
 
-                failure_payload = {
-                    "compile": compile_result,
-                    "pytest": pytest_result,
-                }
-
+                failure_payload = {"compile": compile_result, "pytest": pytest_result}
                 analysis = self.llm_json(
                     """
 You are the failure-analysis specialist.
 Classify the failure without editing code.
-Return JSON:
+Return JSON only:
 {
   "type": "project" or "infrastructure",
   "cause": "brief cause",
@@ -784,41 +806,21 @@ Return JSON:
                 self.event(state, "Failure analyzed", True, analysis)
 
                 if analysis.get("type") == "infrastructure":
-                    self.fail(
-                        state,
-                        str(analysis.get("cause", "Verification environment failure")),
-                        "failure_analysis",
-                    )
+                    self.fail(state, str(analysis.get("cause", "Verification environment failure")), "failure_analysis")
                     return self._finish(state)
 
-                self.update(
-                    state,
-                    "failure_analysis",
-                    "done",
-                    str(analysis.get("cause", "Project failure"))[:120],
-                )
+                self.update(state, "failure_analysis", "done", str(analysis.get("cause", "Project failure"))[:120])
 
                 if attempt >= MAX_REPAIR_ATTEMPTS:
-                    self.fail(
-                        state,
-                        "Maximum repair attempts reached.",
-                        "repair",
-                    )
+                    self.fail(state, "Maximum repair attempts reached.", "repair")
                     return self._finish(state)
 
-                self.update(
-                    state,
-                    "repair",
-                    "active",
-                    f"Repair attempt {attempt + 1} of {MAX_REPAIR_ATTEMPTS}",
-                )
+                self.update(state, "repair", "active", f"Repair attempt {attempt + 1} of {MAX_REPAIR_ATTEMPTS}")
 
                 current_code = []
-                for path in relevant:
+                for path in relevant[:8]:
                     try:
-                        current_code.append(
-                            f"FILE: {path}\n{self.read_text(state.workspace, path)[:7000]}"
-                        )
+                        current_code.append(f"FILE: {path}\n{self.read_text(state.workspace, path)[:7000]}")
                     except Exception:
                         pass
 
@@ -832,40 +834,32 @@ Return focused edits only:
   ],
   "notes":"brief"
 }
-Maximum 2 edits.
-Use exact current text from the supplied code.
-Do not rewrite whole files.
-Do not create dependency-shadowing files.
+Rules:
+- Maximum 2 edits.
+- Use exact current text from the supplied code.
+- Do not rewrite whole files.
+- Do not modify secret files.
+- Do not create dependency-shadowing files.
 """,
-                    f"Failure:\n{json.dumps(failure_payload)[:8000]}\n\n"
-                    f"Current code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
+                    f"Failure:\n{json.dumps(failure_payload)[:8000]}\n\nCurrent code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
                     state,
                 )
 
-                repair_edits = self.normalize_edits(repair)
-                repair_result = self.apply_edits(state.workspace, repair_edits)
-
+                repair_result = self.apply_edits(
+                    state.workspace,
+                    self.normalize_edits(repair),
+                )
                 state.repair_attempts += 1
 
                 if not repair_result["changed_files"]:
-                    self.fail(
-                        state,
-                        "Repair stage produced no valid edits.",
-                        "repair",
-                    )
+                    self.fail(state, "Repair stage produced no valid edits.", "repair")
                     return self._finish(state)
 
                 self.event(state, f"Repair attempt {attempt + 1}", True, repair_result)
-                self.update(
-                    state,
-                    "repair",
-                    "done",
-                    f"Changed: {', '.join(repair_result['changed_files'])}",
-                )
+                self.update(state, "repair", "done", f"Changed: {', '.join(repair_result['changed_files'])}")
 
-            # 9. Sandbox
+            # 9. Sandbox verification
             self.update(state, "sandbox", "active", "Running Streamlit smoke verification")
-
             entry = inspection.get("entry_point") or "app.py"
             entry_path = state.workspace / str(entry)
 
@@ -882,22 +876,17 @@ Do not create dependency-shadowing files.
             self.event(state, "Sandbox verification", smoke.get("ok", False), smoke)
 
             if not smoke.get("ok", False):
-                self.fail(
-                    state,
-                    f"Sandbox verification failed: {smoke.get('error', 'unknown error')}",
-                    "sandbox",
-                )
+                self.fail(state, f"Sandbox verification failed: {smoke.get('error', 'unknown error')}", "sandbox")
                 return self._finish(state)
 
             self.update(state, "sandbox", "done", "Application responded successfully")
 
             # 10. Final report
             self.update(state, "final_report", "active", "Preparing verified report")
-
             final = self.llm_json(
                 """
 You are the final-report specialist.
-Return JSON:
+Return JSON only:
 {
   "report": "markdown report",
   "verified": true or false
@@ -905,13 +894,11 @@ Return JSON:
 Never claim verification that is not present in the supplied results.
 Mention changed files, tests and sandbox status.
 """,
-                json.dumps(
-                    {
-                        "requirement": requirement[:4000],
-                        "verification": state.verification,
-                        "events": state.events[-8:],
-                    }
-                )[:MAX_CONTEXT_CHARS],
+                json.dumps({
+                    "requirement": requirement[:4000],
+                    "verification": state.verification,
+                    "events": state.events[-8:],
+                })[:MAX_CONTEXT_CHARS],
                 state,
             )
 
@@ -919,11 +906,7 @@ Mention changed files, tests and sandbox status.
                 state.final_report = str(final.get("report", "Development run verified."))
                 self.update(state, "final_report", "done", "Verified final report generated")
             else:
-                self.fail(
-                    state,
-                    "Final report could not establish verified completion.",
-                    "final_report",
-                )
+                self.fail(state, "Final report could not establish verified completion.", "final_report")
 
         except Exception as exc:
             stage = self._current_stage(state)
