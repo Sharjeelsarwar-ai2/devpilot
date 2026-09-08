@@ -216,8 +216,19 @@ class WorkflowEngine:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
+                        {
+                            "role": "system",
+                            "content": (
+                                system
+                                + "\\n\\nIMPORTANT: Return the response as valid JSON. "
+                                  "The response must be a JSON object."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": user
+                            + "\\n\\nReturn valid JSON only. Do not use Markdown fences.",
+                        },
                     ],
                     temperature=0,
                     max_tokens=MAX_OUTPUT_TOKENS,
@@ -225,6 +236,11 @@ class WorkflowEngine:
                 )
 
                 text = response.choices[0].message.content or "{}"
+                # Be defensive with provider/model responses.
+                text = text.strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```(?:json)?\\s*", "", text, flags=re.I)
+                    text = re.sub(r"\\s*```$", "", text)
                 data = json.loads(text)
 
                 if not isinstance(data, dict):
@@ -290,11 +306,11 @@ class WorkflowEngine:
         edits: list[dict[str, str]],
     ) -> dict[str, Any]:
         changed = []
+        originals: dict[Path, str | None] = {}
 
         for edit in edits:
             target = self.safe_path(workspace, edit["path"])
 
-            # Never let the model shadow core dependencies.
             blocked_names = {
                 "streamlit.py",
                 "groq.py",
@@ -312,16 +328,14 @@ class WorkflowEngine:
 
             if target.exists():
                 current = self.read_text(workspace, edit["path"])
-
                 if edit["search"] not in current:
                     continue
-
+                originals.setdefault(target, current)
                 updated = current.replace(
-                    edit["search"],
-                    edit["replace"],
-                    1,
+                    edit["search"], edit["replace"], 1
                 )
             else:
+                originals.setdefault(target, None)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 updated = edit["replace"]
 
@@ -330,6 +344,27 @@ class WorkflowEngine:
 
             target.write_text(updated, encoding="utf-8")
             changed.append(edit["path"])
+
+        # Never leave the project in a syntactically broken Python state.
+        if changed:
+            compile_result = self.compile_project(workspace)
+            if not compile_result["ok"]:
+                for target, original in originals.items():
+                    if original is None:
+                        try:
+                            target.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    else:
+                        target.write_text(original, encoding="utf-8")
+                return {
+                    "ok": False,
+                    "changed_files": [],
+                    "count": 0,
+                    "rolled_back": True,
+                    "error": "Edits were rolled back because they introduced a Python syntax error.",
+                    "compile": compile_result,
+                }
 
         return {
             "ok": True,
