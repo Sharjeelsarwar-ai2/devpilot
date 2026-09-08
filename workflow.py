@@ -28,6 +28,8 @@ MAX_AGENT_TURNS = 8
 MAX_REPAIR_ATTEMPTS = 2
 MAX_RATE_LIMIT_RETRIES = 1
 MAX_LLM_OUTPUT = 1500
+MAX_TOOL_CONTEXT_CHARS = 7_000
+MAX_ERROR_CONTEXT_CHARS = 6_000
 GENERATED_TEST_PATH = "tests/test_devpilot_requirements.py"
 SANDBOX_RUNNER = Path(__file__).with_name("sandbox_runner.py")
 
@@ -184,39 +186,53 @@ def search_file(workspace: Path, path: str, query: str) -> Dict[str, Any]:
     return {"ok": True, "path": path, "query": query, "hits": hits}
 
 
-def read_file(workspace: Path, path: str, start_line: int = 1, max_lines: int = MAX_READ_LINES) -> Dict[str, Any]:
+def read_file(
+    workspace: Path,
+    path: str,
+    start_line: int = 1,
+    max_lines: int = MAX_READ_LINES,
+    line_start: Optional[int] = None,
+    line_end: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Read a bounded file window; tolerate multiple common range-key conventions."""
+    if line_start is not None:
+        start_line = line_start
+    if line_end is not None:
+        try:
+            s_line = int(start_line)
+            e_line = int(line_end)
+            if e_line >= s_line:
+                max_lines = e_line - s_line + 1
+        except (TypeError, ValueError):
+            pass
+
     target = safe_workspace_path(workspace, path)
     if not target.exists() or not target.is_file():
         return {"ok": False, "error": f"File not found: {path}"}
     if target.stat().st_size > MAX_FILE_BYTES:
         return {"ok": False, "error": f"{path} exceeds the read size limit."}
 
-    # Be forgiving about model-generated line ranges. A bad range should not
-    # consume an entire workflow stage; normalize it to the nearest valid range.
-    requested_start = start_line
-    requested_max = max_lines
     try:
         lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
     except UnicodeDecodeError:
         return {"ok": False, "error": f"{path} is not UTF-8 text."}
 
-    total_lines = len(lines)
-    normalized_max = max(1, min(int(max_lines), 300))
-    if total_lines == 0:
-        return {
-            "ok": True,
-            "path": path,
-            "start_line": 1,
-            "end_line": 0,
-            "total_lines": 0,
-            "content": "",
-            "warning": "File is empty.",
-        }
+    try:
+        requested_start = int(start_line)
+    except (TypeError, ValueError):
+        requested_start = 1
+    try:
+        requested_max = int(max_lines)
+    except (TypeError, ValueError):
+        requested_max = MAX_READ_LINES
 
-    normalized_start = int(start_line)
-    if normalized_start < 1:
-        normalized_start = 1
-    elif normalized_start > total_lines:
+    total_lines = len(lines)
+    normalized_max = max(1, min(requested_max, MAX_READ_LINES))
+    if total_lines == 0:
+        return {"ok": True, "path": path, "start_line": 1, "end_line": 0, "total_lines": 0, "content": ""}
+
+    normalized_start = max(1, requested_start)
+    if normalized_start > total_lines:
         normalized_start = max(1, total_lines - normalized_max + 1)
 
     selected = lines[normalized_start - 1 : normalized_start - 1 + normalized_max]
@@ -229,13 +245,10 @@ def read_file(workspace: Path, path: str, start_line: int = 1, max_lines: int = 
         "start_line": normalized_start,
         "end_line": end_line,
         "total_lines": total_lines,
-        "content": numbered[:MAX_FILE_BYTES],
+        "content": numbered[:MAX_TOOL_CONTEXT_CHARS],
     }
     if normalized_start != requested_start or normalized_max != requested_max:
-        result["warning"] = (
-            f"Requested range ({requested_start}, {requested_max}) was normalized "
-            f"to a valid range ({normalized_start}, {normalized_max})."
-        )
+        result["warning"] = f"Requested range ({requested_start}, {requested_max}) was normalized to ({normalized_start}, {normalized_max})."
     return result
 
 
@@ -376,24 +389,32 @@ TOOL_LIST = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List the project files available in the workspace.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            "description": "List project files. Use {} as arguments.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            },
         },
     },
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a bounded line range from a UTF-8 project file.",
+            "description": (
+                "Read a bounded UTF-8 file window. Preferred keys: path, start_line, max_lines. "
+                "Aliases line_start and line_end are accepted. Do not send full-file rewrites."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "start_line": {"type": "integer"},
                     "max_lines": {"type": "integer"},
+                    "line_start": {"type": "integer"},
+                    "line_end": {"type": "integer"},
                 },
-                "required": ["path"],
-                "additionalProperties": False,
+                "additionalProperties": True,
             },
         },
     },
@@ -401,12 +422,11 @@ TOOL_LIST = [
         "type": "function",
         "function": {
             "name": "search_file",
-            "description": "Search one project file and return small contextual matches.",
+            "description": "Search one project file. Keys: path and query.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}, "query": {"type": "string"}},
-                "required": ["path", "query"],
-                "additionalProperties": False,
+                "additionalProperties": True,
             },
         },
     },
@@ -414,12 +434,17 @@ TOOL_LIST = [
         "type": "function",
         "function": {
             "name": "apply_patch",
-            "description": "Replace exactly one existing text block with another small text block. Read/search first.",
+            "description": "Replace exactly one existing text block. Keys: path, old_text, new_text. Use small localized edits.",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
-                "required": ["path", "old_text", "new_text"],
-                "additionalProperties": False,
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                    "old": {"type": "string"},
+                    "new": {"type": "string"},
+                },
+                "additionalProperties": True,
             },
         },
     },
@@ -427,12 +452,11 @@ TOOL_LIST = [
         "type": "function",
         "function": {
             "name": "create_file",
-            "description": "Create a new small UTF-8 file. For larger files use append_file chunks.",
+            "description": "Create a new UTF-8 file. Keys: path and content. Keep content reasonably small.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                "required": ["path", "content"],
-                "additionalProperties": False,
+                "additionalProperties": True,
             },
         },
     },
@@ -440,16 +464,16 @@ TOOL_LIST = [
         "type": "function",
         "function": {
             "name": "append_file",
-            "description": "Append a small chunk to a file, useful for generated tests.",
+            "description": "Append one small UTF-8 chunk. Keys: path and content.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                "required": ["path", "content"],
-                "additionalProperties": False,
+                "additionalProperties": True,
             },
         },
     },
 ]
+
 
 IMPLEMENT_TOOLS = [TOOL_LIST[0], TOOL_LIST[1], TOOL_LIST[2], TOOL_LIST[3], TOOL_LIST[4], TOOL_LIST[5]]
 READ_TOOLS = [TOOL_LIST[0], TOOL_LIST[1], TOOL_LIST[2]]
@@ -508,12 +532,17 @@ class WorkflowEngine:
         log_event(self.state, tool, ok, detail, result)
         callback_event(self.state, self.callback)
 
-    def _request(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, max_tokens: int = MAX_LLM_OUTPUT):
-        common = {
+    def _request(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: int = MAX_LLM_OUTPUT,
+    ):
+        common: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": 0,
-            "max_tokens": max_tokens,
+            "max_tokens": min(int(max_tokens), MAX_LLM_OUTPUT),
         }
         if tools is not None:
             common["tools"] = tools
@@ -521,56 +550,97 @@ class WorkflowEngine:
             common["parallel_tool_calls"] = False
 
         rate_retries = 0
-        tool_retries = 0
+        malformed_retries = 0
         while True:
             try:
                 return self.client.chat.completions.create(**common)
             except RateLimitError as exc:
-                if rate_retries < MAX_RATE_LIMIT_RETRIES:
-                    import time
-                    rate_retries += 1
-                    time.sleep(10)
-                    continue
-                raise AgentRateLimitError(
-                    "Groq rate limit reached. The workflow stopped safely after one retry."
-                ) from exc
+                if rate_retries >= MAX_RATE_LIMIT_RETRIES:
+                    raise AgentRateLimitError(
+                        "Groq token rate limit reached. The workflow stopped after one bounded retry."
+                    ) from exc
+                rate_retries += 1
+                import re, time
+                match = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", str(exc), re.I)
+                wait_s = min(15.0, max(2.0, float(match.group(1)) if match else 8.0))
+                time.sleep(wait_s + 0.25)
             except BadRequestError as exc:
                 message = str(exc)
-                malformed = (
-                    "failed to parse tool call arguments" in message.lower()
-                    or "tool_use_failed" in message.lower()
-                    or "invalid tool call" in message.lower()
+                lower = message.lower()
+                is_schema = "invalid json schema" in lower or ("schema" in lower and "parameters" in lower and "tool" in lower)
+                is_tool_bad = (
+                    "failed to parse tool call arguments" in lower
+                    or "tool_use_failed" in lower
+                    or "invalid tool call" in lower
+                    or "tool call validation failed" in lower
                 )
-                schema_error = "invalid json schema" in message.lower()
-                if tools is not None and malformed and not schema_error and tool_retries < 1:
-                    tool_retries += 1
-                    # Ask for a fresh generation with a smaller output budget.
-                    common["max_tokens"] = min(max_tokens, 1100)
+                if tools is not None and is_tool_bad and not is_schema and malformed_retries < 1:
+                    malformed_retries += 1
+                    common["max_tokens"] = min(int(common["max_tokens"]), 900)
                     continue
-                raise FatalAgentError(f"Groq rejected the request: {message[:700]}") from exc
+                raise FatalAgentError(f"Groq rejected the request: {message[:900]}") from exc
             except Exception as exc:
                 raise FatalAgentError(f"Groq request failed: {exc}") from exc
+
+    def _tool_error(self, name: str, message: str) -> Dict[str, Any]:
+        result = {"ok": False, "error_type": "tool_arguments", "error": message}
+        self._event(name, False, f"{name.replace('_', ' ').title()} · {message[:120]}", result)
+        return result
 
     def _tool_execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         workspace = self.state.workspace
         assert workspace is not None
-        if name == "list_files":
-            result = list_files(workspace)
-        elif name == "read_file":
-            result = read_file(workspace, args["path"], int(args.get("start_line", 1)), int(args.get("max_lines", MAX_READ_LINES)))
-        elif name == "search_file":
-            result = search_file(workspace, args["path"], args["query"])
-        elif name == "apply_patch":
-            result = apply_patch(workspace, args["path"], args["old_text"], args["new_text"])
-        elif name == "create_file":
-            result = create_file(workspace, args["path"], args["content"])
-        elif name == "append_file":
-            result = append_file(workspace, args["path"], args["content"])
-        else:
-            result = {"ok": False, "error": f"Unknown tool: {name}"}
+        try:
+            if name == "list_files":
+                result = list_files(workspace)
+            elif name == "read_file":
+                path = args.get("path")
+                if not isinstance(path, str) or not path.strip():
+                    return self._tool_error(name, "read_file requires a path string.")
+                result = read_file(
+                    workspace,
+                    path,
+                    start_line=args.get("start_line", args.get("line_start", 1)),
+                    max_lines=args.get("max_lines", MAX_READ_LINES),
+                    line_start=args.get("line_start"),
+                    line_end=args.get("line_end"),
+                )
+            elif name == "search_file":
+                path, query = args.get("path"), args.get("query")
+                if not isinstance(path, str) or not isinstance(query, str):
+                    return self._tool_error(name, "search_file requires path and query strings.")
+                result = search_file(workspace, path, query)
+            elif name == "apply_patch":
+                path = args.get("path") or args.get("file_path")
+                old_text = args.get("old_text")
+                if old_text is None:
+                    old_text = args.get("old", args.get("find_text"))
+                new_text = args.get("new_text")
+                if new_text is None:
+                    new_text = args.get("new", args.get("replace_with"))
+                if not all(isinstance(v, str) for v in (path, old_text, new_text)):
+                    return self._tool_error(name, "apply_patch requires path, old_text and new_text strings.")
+                result = apply_patch(workspace, path, old_text, new_text)
+            elif name == "create_file":
+                path = args.get("path") or args.get("file_path")
+                content = args.get("content")
+                if not isinstance(path, str) or not isinstance(content, str):
+                    return self._tool_error(name, "create_file requires path and content strings.")
+                result = create_file(workspace, path, content)
+            elif name == "append_file":
+                path = args.get("path") or args.get("file_path")
+                content = args.get("content")
+                if not isinstance(path, str) or not isinstance(content, str):
+                    return self._tool_error(name, "append_file requires path and content strings.")
+                result = append_file(workspace, path, content)
+            else:
+                result = {"ok": False, "error": f"Unknown tool: {name}"}
+        except Exception as exc:
+            result = {"ok": False, "error_type": "tool_execution", "error": str(exc)}
         detail = name.replace("_", " ").title()
-        if "path" in args:
-            detail += f" · {args['path']}"
+        path_value = args.get("path") or args.get("file_path")
+        if isinstance(path_value, str):
+            detail += f" · {path_value}"
         if not result.get("ok", False):
             detail += f" · {str(result.get('error', 'failed'))[:120]}"
         self._event(name, bool(result.get("ok", False)), detail, result)
@@ -589,6 +659,8 @@ class WorkflowEngine:
             {"role": "user", "content": user_prompt},
         ]
         final_text = ""
+        repeated_failure_signature = None
+        repeated_failure_count = 0
         for _ in range(max_turns):
             response = self._request(messages, tools=tools, max_tokens=max_tokens)
             message = response.choices[0].message
@@ -608,13 +680,25 @@ class WorkflowEngine:
                     if not isinstance(args, dict):
                         raise ValueError("Tool arguments must be a JSON object.")
                     result = self._tool_execute(tc.function.name, args)
+                    if not result.get("ok", False):
+                        signature = (tc.function.name, str(result.get("error", ""))[:300])
+                        if signature == repeated_failure_signature:
+                            repeated_failure_count += 1
+                        else:
+                            repeated_failure_signature = signature
+                            repeated_failure_count = 1
+                        if repeated_failure_count >= 2:
+                            raise FatalAgentError(
+                                f"Repeated tool failure stopped the stage: {tc.function.name} → {str(result.get('error', 'failed'))[:300]}"
+                            )
                 except json.JSONDecodeError as exc:
-                    result = {"ok": False, "error_type": "tool_arguments", "error": f"Invalid JSON arguments: {exc}"}
+                    result = {"ok": False, "error_type": "tool_arguments", "fatal": True, "error": f"Invalid JSON arguments: {exc}"}
                     self._event(tc.function.name, False, "Malformed local tool arguments", result)
+                    raise FatalAgentError(f"Malformed arguments for tool {tc.function.name}: {exc}") from exc
                 except Exception as exc:
                     result = {"ok": False, "error_type": "tool_execution", "error": str(exc)}
                     self._event(tc.function.name, False, "Tool execution error", result)
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, ensure_ascii=False)[:14_000]})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, ensure_ascii=False)[:MAX_TOOL_CONTEXT_CHARS]})
         if not final_text:
             raise FatalAgentError("Agent reached its bounded tool-call limit without finishing the stage.")
         return final_text
