@@ -301,77 +301,180 @@ class WorkflowEngine:
         return normalized
 
     def apply_edits(
-        self,
-        workspace: Path,
-        edits: list[dict[str, str]],
-    ) -> dict[str, Any]:
-        changed = []
-        originals: dict[Path, str | None] = {}
+    self,
+    workspace: Path,
+    edits: list[dict[str, str]],
+) -> dict[str, Any]:
+    changed = []
+    originals: dict[Path, str | None] = {}
 
-        for edit in edits:
-            target = self.safe_path(workspace, edit["path"])
+    def normalize_text(text: str) -> str:
+        """
+        Normalize whitespace only for matching.
+        The actual replacement is still performed on the original text.
+        """
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.rstrip() for line in text.split("\n")]
+        return "\n".join(lines).strip()
 
-            blocked_names = {
-                "streamlit.py",
-                "groq.py",
-                "pytest.py",
-                "subprocess.py",
-                "os.py",
-                "json.py",
-            }
+    def find_normalized_match(current: str, search: str):
+        """
+        Find a search block while tolerating indentation/whitespace
+        differences. Returns (start, end) in the ORIGINAL string.
+        """
+        if search in current:
+            return current.index(search), current.index(search) + len(search)
 
-            if target.name in blocked_names:
-                continue
+        current_lines = current.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+        search_lines = search.replace("\r\n", "\n").replace("\r", "\n").splitlines()
 
-            if "secrets" in target.parts or target.name in {".env", "secrets.toml"}:
-                continue
+        # Remove empty leading/trailing lines for matching.
+        while search_lines and not search_lines[0].strip():
+            search_lines.pop(0)
 
-            if target.exists():
-                current = self.read_text(workspace, edit["path"])
-                if edit["search"] not in current:
-                    continue
-                originals.setdefault(target, current)
-                updated = current.replace(
-                    edit["search"], edit["replace"], 1
+        while search_lines and not search_lines[-1].strip():
+            search_lines.pop()
+
+        if not search_lines:
+            return None
+
+        normalized_search = [
+            line.strip()
+            for line in search_lines
+            if line.strip()
+        ]
+
+        if not normalized_search:
+            return None
+
+        # Find the block using stripped line contents.
+        for i in range(len(current_lines) - len(search_lines) + 1):
+            candidate = [
+                line.strip()
+                for line in current_lines[i:i + len(search_lines)]
+                if line.strip()
+            ]
+
+            if candidate == normalized_search:
+                # Calculate character offsets in the original normalized-newline text.
+                normalized_current = current.replace("\r\n", "\n").replace("\r", "\n")
+
+                start = sum(
+                    len(line) + 1
+                    for line in normalized_current.split("\n")[:i]
                 )
-            else:
-                originals.setdefault(target, None)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                updated = edit["replace"]
 
-            if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
-                continue
+                end = sum(
+                    len(line) + 1
+                    for line in normalized_current.split("\n")[:i + len(search_lines)]
+                )
 
-            target.write_text(updated, encoding="utf-8")
-            changed.append(edit["path"])
+                if end > start and normalized_current.endswith("\n"):
+                    end -= 1
 
-        # Never leave the project in a syntactically broken Python state.
-        if changed:
-            compile_result = self.compile_project(workspace)
-            if not compile_result["ok"]:
-                for target, original in originals.items():
-                    if original is None:
-                        try:
-                            target.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    else:
-                        target.write_text(original, encoding="utf-8")
-                return {
-                    "ok": False,
-                    "changed_files": [],
-                    "count": 0,
-                    "rolled_back": True,
-                    "error": "Edits were rolled back because they introduced a Python syntax error.",
-                    "compile": compile_result,
-                }
+                return start, end
 
-        return {
-            "ok": True,
-            "changed_files": changed,
-            "count": len(changed),
+        return None
+
+    for edit in edits:
+        target = self.safe_path(workspace, edit["path"])
+
+        blocked_names = {
+            "streamlit.py",
+            "groq.py",
+            "pytest.py",
+            "subprocess.py",
+            "os.py",
+            "json.py",
         }
 
+        if target.name in blocked_names:
+            continue
+
+        if "secrets" in target.parts or target.name in {".env", "secrets.toml"}:
+            continue
+
+        if target.exists():
+            current = self.read_text(workspace, edit["path"])
+
+            # First try exact matching.
+            if edit["search"] in current:
+                updated = current.replace(
+                    edit["search"],
+                    edit["replace"],
+                    1,
+                )
+
+            else:
+                # Then tolerate harmless whitespace/indentation differences.
+                match = find_normalized_match(
+                    current,
+                    edit["search"],
+                )
+
+                if match is None:
+                    continue
+
+                start, end = match
+
+                normalized_current = current.replace("\r\n", "\n").replace("\r", "\n")
+
+                updated = (
+                    normalized_current[:start]
+                    + edit["replace"]
+                    + normalized_current[end:]
+                )
+
+        else:
+            originals.setdefault(target, None)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            updated = edit["replace"]
+
+        if target not in originals:
+            originals[target] = current if target.exists() else None
+
+        if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
+            continue
+
+        target.write_text(updated, encoding="utf-8")
+
+        if edit["path"] not in changed:
+            changed.append(edit["path"])
+
+    # Never leave the project in a syntactically broken Python state.
+    if changed:
+        compile_result = self.compile_project(workspace)
+
+        if not compile_result["ok"]:
+            for target, original in originals.items():
+                if original is None:
+                    try:
+                        target.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                else:
+                    target.write_text(
+                        original,
+                        encoding="utf-8",
+                    )
+
+            return {
+                "ok": False,
+                "changed_files": [],
+                "count": 0,
+                "rolled_back": True,
+                "error": (
+                    "Edits were rolled back because they introduced "
+                    "a Python syntax error."
+                ),
+                "compile": compile_result,
+            }
+
+    return {
+        "ok": True,
+        "changed_files": changed,
+        "count": len(changed),
+    }
     # -------------------------
     # Deterministic verification
     # -------------------------
@@ -563,96 +666,67 @@ class WorkflowEngine:
 
             # 1. Requirements
             self.update(state, "requirements", "active", "Extracting acceptance criteria")
-            criteria = self.llm_json(
-                """
-You are the requirements analyst in a software development workflow.
-Return compact JSON only:
+impl = self.llm_json(
+    """
+You are the implementation specialist.
+
+Your job is to modify the existing project using SMALL, PRECISE edits.
+
+Return JSON only:
+
 {
-  "summary": "one sentence",
-  "criteria": ["criterion 1", "criterion 2"],
-  "risk": "one sentence"
+  "edits": [
+    {
+      "path": "file.py",
+      "search": "exact existing text",
+      "replace": "replacement text"
+    }
+  ],
+  "notes": "brief explanation"
 }
-Do not write code.
-""",
-                requirement[:6000],
-                state,
-            )
-            state.verification["criteria"] = criteria.get("criteria", [])
-            self.event(
-                state,
-                "Requirements analyzed",
-                True,
-                criteria,
-            )
-            self.update(state, "requirements", "done", "Acceptance criteria created")
 
-            # 2. Inspection
-            self.update(state, "inspection", "active", "Mapping project files")
-            files = self.project_map(state.workspace)
+STRICT RULES:
 
-            map_text = "\n".join(
-                f"- {x['path']} ({x['size']} bytes)" for x in files
-            )[:MAX_CONTEXT_CHARS]
+1. Maximum 3 edits.
 
-            inspection = self.llm_json(
-                """
-You are the inspection specialist.
-Given a project file map and requirement, identify only the most relevant files.
-Return JSON:
-{
-  "relevant_files": ["path1", "path2"],
-  "entry_point": "app.py or another file",
-  "notes": "brief architecture notes"
-}
-Do not edit code.
-""",
-                f"Requirement:\n{requirement[:5000]}\n\nFiles:\n{map_text}",
-                state,
-            )
+2. The "path" must be one of the files actually supplied in the
+   Current Code section.
 
-            relevant = [
-                x for x in inspection.get("relevant_files", [])
-                if isinstance(x, str)
-            ][:5]
+3. The "search" field MUST identify existing code from the Current Code.
 
-            if not relevant:
-                relevant = ["app.py"] if (state.workspace / "app.py").exists() else []
+4. Do NOT invent code that is not present in the Current Code.
 
-            snippets = []
-            for path in relevant:
-                try:
-                    snippets.append(
-                        f"FILE: {path}\n{self.read_text(state.workspace, path)[:7000]}"
-                    )
-                except Exception:
-                    pass
+5. Keep the search block as SMALL as possible while still being unique.
 
-            state.verification["relevant_files"] = relevant
-            state.verification["inspection"] = inspection
+6. Do NOT rewrite an entire file.
 
-            self.event(
-                state,
-                "Project inspected",
-                True,
-                {
-                    "relevant_files": relevant,
-                    "entry_point": inspection.get("entry_point", "app.py"),
-                },
-            )
-            self.update(state, "inspection", "done", f"Relevant files: {', '.join(relevant) or 'none'}")
+7. Do NOT replace an entire function unless absolutely necessary.
 
-            # 3. Design
-            self.update(state, "design", "active", "Choosing minimal implementation")
-            design = self.llm_json(
-                """
-You are the solution-design specialist.
-Return JSON:
-{
-  "plan": ["small step 1", "small step 2"],
-  "files_to_change": ["path"],
-  "avoid": ["thing not to do"]
-}
-Keep the solution minimal. Do not rewrite whole files.
+8. Preserve the existing indentation style.
+
+9. For Python code, preserve valid indentation.
+
+10. Do not modify secret files.
+
+11. Do not create dependency-shadowing files such as:
+    streamlit.py
+    groq.py
+    pytest.py
+    subprocess.py
+    os.py
+    json.py
+
+12. If the requested change cannot be safely represented as a
+    matching edit, return:
+    {
+      "edits": [],
+      "notes": "Cannot safely produce a matching edit."
+    }
+
+13. The replacement must be valid code in the context where the
+    search text occurs.
+
+14. Return valid JSON only. No Markdown. No ``` fences.
 """,
                 f"Requirement:\n{requirement[:5000]}\n\nCurrent code:\n{chr(10).join(snippets)[:MAX_CONTEXT_CHARS]}",
                 state,
