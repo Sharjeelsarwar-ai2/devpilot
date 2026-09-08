@@ -190,18 +190,53 @@ def read_file(workspace: Path, path: str, start_line: int = 1, max_lines: int = 
         return {"ok": False, "error": f"File not found: {path}"}
     if target.stat().st_size > MAX_FILE_BYTES:
         return {"ok": False, "error": f"{path} exceeds the read size limit."}
-    if start_line < 1 or max_lines < 1 or max_lines > 300:
-        return {"ok": False, "error": "Invalid read range."}
-    lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
-    selected = lines[start_line - 1 : start_line - 1 + max_lines]
-    numbered = "".join(f"{i}: {line}" for i, line in enumerate(selected, start_line))
-    return {
+
+    # Be forgiving about model-generated line ranges. A bad range should not
+    # consume an entire workflow stage; normalize it to the nearest valid range.
+    requested_start = start_line
+    requested_max = max_lines
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return {"ok": False, "error": f"{path} is not UTF-8 text."}
+
+    total_lines = len(lines)
+    normalized_max = max(1, min(int(max_lines), 300))
+    if total_lines == 0:
+        return {
+            "ok": True,
+            "path": path,
+            "start_line": 1,
+            "end_line": 0,
+            "total_lines": 0,
+            "content": "",
+            "warning": "File is empty.",
+        }
+
+    normalized_start = int(start_line)
+    if normalized_start < 1:
+        normalized_start = 1
+    elif normalized_start > total_lines:
+        normalized_start = max(1, total_lines - normalized_max + 1)
+
+    selected = lines[normalized_start - 1 : normalized_start - 1 + normalized_max]
+    end_line = normalized_start + len(selected) - 1
+    numbered = "".join(f"{i}: {line}" for i, line in enumerate(selected, normalized_start))
+
+    result: Dict[str, Any] = {
         "ok": True,
         "path": path,
-        "start_line": start_line,
-        "end_line": start_line + len(selected) - 1,
+        "start_line": normalized_start,
+        "end_line": end_line,
+        "total_lines": total_lines,
         "content": numbered[:MAX_FILE_BYTES],
     }
+    if normalized_start != requested_start or normalized_max != requested_max:
+        result["warning"] = (
+            f"Requested range ({requested_start}, {requested_max}) was normalized "
+            f"to a valid range ({normalized_start}, {normalized_max})."
+        )
+    return result
 
 
 def apply_patch(workspace: Path, path: str, old_text: str, new_text: str) -> Dict[str, Any]:
@@ -612,7 +647,7 @@ Acceptance criteria must be observable and testable. Do not design implementatio
             INSPECTOR_PROMPT,
             f"REQUEST:\n{self.state.requirements}\n\nDo not modify files. Return a concise inspection summary. Begin with list_files.\n",
             READ_TOOLS,
-            max_turns=5,
+            max_turns=7,
             max_tokens=900,
         )
         self.state.inspection = result_text
@@ -634,8 +669,8 @@ Use the inspection summary. Prefer existing patterns. Mention files to change an
             IMPLEMENTER_PROMPT,
             f"REQUEST:\n{self.state.requirements}\n\nREQUIREMENT BRIEF:\n{self.state.requirement_plan}\n\nINSPECTION:\n{self.state.inspection}\n\nDESIGN:\n{self.state.design}\n\nImplement now. End with a concise summary.",
             IMPLEMENT_TOOLS,
-            max_turns=MAX_AGENT_TURNS,
-            max_tokens=1400,
+            max_turns=8,
+            max_tokens=1200,
         )
         self._set("implementation", "done", "Requested changes applied")
 
@@ -659,7 +694,7 @@ IMPLEMENTATION SUMMARY:
 Review the current files as needed. Create {GENERATED_TEST_PATH}.
 Rules: generate a small number of requirement-focused tests; use pytest; for Streamlit use AppTest when practical; do not assume features not supported by the requirement; don't modify app code.
 """
-        self._tool_loop(TESTER_PROMPT, test_prompt, TEST_TOOLS, max_turns=6, max_tokens=1300)
+        self._tool_loop(TESTER_PROMPT, test_prompt, TEST_TOOLS, max_turns=8, max_tokens=1100)
         if not (workspace / GENERATED_TEST_PATH).exists():
             raise FatalAgentError("Test generation stage finished without creating requirement tests.")
         self.state.test_path = GENERATED_TEST_PATH
@@ -757,7 +792,7 @@ VERIFICATION FAILURE:
 
 Repair only the application code necessary to satisfy the requirement and fix the root cause. Use localized patches.
 """
-        self._tool_loop(REPAIR_PROMPT, repair_prompt, IMPLEMENT_TOOLS, max_turns=6, max_tokens=1300)
+        self._tool_loop(REPAIR_PROMPT, repair_prompt, IMPLEMENT_TOOLS, max_turns=8, max_tokens=1100)
         self.state.repair_attempts += 1
         self._set("repair", "done", f"Repair attempt {self.state.repair_attempts} applied")
 
