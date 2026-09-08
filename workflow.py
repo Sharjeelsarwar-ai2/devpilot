@@ -300,7 +300,7 @@ class WorkflowEngine:
 
         return normalized
 
-    def apply_edits(
+   def apply_edits(
     self,
     workspace: Path,
     edits: list[dict[str, str]],
@@ -308,27 +308,21 @@ class WorkflowEngine:
     changed = []
     originals: dict[Path, str | None] = {}
 
-    def normalize_text(text: str) -> str:
-        """
-        Normalize whitespace only for matching.
-        The actual replacement is still performed on the original text.
-        """
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        lines = [line.rstrip() for line in text.split("\n")]
-        return "\n".join(lines).strip()
-
     def find_normalized_match(current: str, search: str):
         """
-        Find a search block while tolerating indentation/whitespace
-        differences. Returns (start, end) in the ORIGINAL string.
+        Find a search block while tolerating whitespace/indentation differences.
+        Returns (start, end) in the normalized source text.
         """
-        if search in current:
-            return current.index(search), current.index(search) + len(search)
+        current_normalized = current.replace("\r\n", "\n").replace("\r", "\n")
+        search_normalized = search.replace("\r\n", "\n").replace("\r", "\n")
 
-        current_lines = current.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-        search_lines = search.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+        if search_normalized in current_normalized:
+            start = current_normalized.index(search_normalized)
+            return start, start + len(search_normalized)
 
-        # Remove empty leading/trailing lines for matching.
+        current_lines = current_normalized.split("\n")
+        search_lines = search_normalized.split("\n")
+
         while search_lines and not search_lines[0].strip():
             search_lines.pop(0)
 
@@ -338,38 +332,22 @@ class WorkflowEngine:
         if not search_lines:
             return None
 
-        normalized_search = [
-            line.strip()
-            for line in search_lines
-            if line.strip()
-        ]
+        wanted = [line.strip() for line in search_lines]
 
-        if not normalized_search:
-            return None
-
-        # Find the block using stripped line contents.
         for i in range(len(current_lines) - len(search_lines) + 1):
             candidate = [
                 line.strip()
                 for line in current_lines[i:i + len(search_lines)]
-                if line.strip()
             ]
 
-            if candidate == normalized_search:
-                # Calculate character offsets in the original normalized-newline text.
-                normalized_current = current.replace("\r\n", "\n").replace("\r", "\n")
-
-                start = sum(
-                    len(line) + 1
-                    for line in normalized_current.split("\n")[:i]
-                )
-
+            if candidate == wanted:
+                start = sum(len(line) + 1 for line in current_lines[:i])
                 end = sum(
                     len(line) + 1
-                    for line in normalized_current.split("\n")[:i + len(search_lines)]
+                    for line in current_lines[:i + len(search_lines)]
                 )
 
-                if end > start and normalized_current.endswith("\n"):
+                if end > start and current_normalized.endswith("\n"):
                     end -= 1
 
                 return start, end
@@ -391,22 +369,22 @@ class WorkflowEngine:
         if target.name in blocked_names:
             continue
 
-        if "secrets" in target.parts or target.name in {".env", "secrets.toml"}:
+        if "secrets" in target.parts or target.name in {
+            ".env",
+            "secrets.toml",
+        }:
             continue
 
         if target.exists():
             current = self.read_text(workspace, edit["path"])
 
-            # First try exact matching.
             if edit["search"] in current:
                 updated = current.replace(
                     edit["search"],
                     edit["replace"],
                     1,
                 )
-
             else:
-                # Then tolerate harmless whitespace/indentation differences.
                 match = find_normalized_match(
                     current,
                     edit["search"],
@@ -416,15 +394,17 @@ class WorkflowEngine:
                     continue
 
                 start, end = match
-
-                normalized_current = current.replace("\r\n", "\n").replace("\r", "\n")
+                normalized_current = (
+                    current
+                    .replace("\r\n", "\n")
+                    .replace("\r", "\n")
+                )
 
                 updated = (
                     normalized_current[:start]
                     + edit["replace"]
                     + normalized_current[end:]
                 )
-
         else:
             originals.setdefault(target, None)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -441,7 +421,7 @@ class WorkflowEngine:
         if edit["path"] not in changed:
             changed.append(edit["path"])
 
-    # Never leave the project in a syntactically broken Python state.
+    # Roll back edits if they introduce Python syntax errors.
     if changed:
         compile_result = self.compile_project(workspace)
 
@@ -663,74 +643,6 @@ class WorkflowEngine:
 
         try:
             state.workspace = self.extract(uploaded_file)
-
-            # 1. Requirements
-            self.update(state, "requirements", "active", "Extracting acceptance criteria")
-impl = self.llm_json(
-    """
-You are the implementation specialist.
-
-Your job is to modify the existing project using SMALL, PRECISE edits.
-
-Return JSON only:
-
-{
-  "edits": [
-    {
-      "path": "file.py",
-      "search": "exact existing text",
-      "replace": "replacement text"
-    }
-  ],
-  "notes": "brief explanation"
-}
-
-STRICT RULES:
-
-1. Maximum 3 edits.
-
-2. The "path" must be one of the files actually supplied in the
-   Current Code section.
-
-3. The "search" field MUST identify existing code from the Current Code.
-
-4. Do NOT invent code that is not present in the Current Code.
-
-5. Keep the search block as SMALL as possible while still being unique.
-
-6. Do NOT rewrite an entire file.
-
-7. Do NOT replace an entire function unless absolutely necessary.
-
-8. Preserve the existing indentation style.
-
-9. For Python code, preserve valid indentation.
-
-10. Do not modify secret files.
-
-11. Do not create dependency-shadowing files such as:
-    streamlit.py
-    groq.py
-    pytest.py
-    subprocess.py
-    os.py
-    json.py
-
-12. If the requested change cannot be safely represented as a
-    matching edit, return:
-    {
-      "edits": [],
-      "notes": "Cannot safely produce a matching edit."
-    }
-
-13. The replacement must be valid code in the context where the
-    search text occurs.
-
-14. Return valid JSON only. No Markdown. No ``` fences.
-""",
-                f"Requirement:\n{requirement[:5000]}\n\nCurrent code:\n{chr(10).join(snippets)[:MAX_CONTEXT_CHARS]}",
-                state,
-            )
 
             state.verification["design"] = design
             self.event(state, "Solution designed", True, design)
