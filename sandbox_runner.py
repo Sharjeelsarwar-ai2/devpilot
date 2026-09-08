@@ -31,20 +31,22 @@ def scrubbed_env(workspace: Path) -> dict:
     return allowed
 
 
-def apply_limits(cpu_seconds: int = 18, max_file_bytes: int = 8 * 1024 * 1024):
+def apply_limits(cpu_seconds: int = 60, max_file_bytes: int = 8 * 1024 * 1024):
     if resource is None:
         return
+
+    # Do NOT set RLIMIT_NPROC here. On hosted Linux environments such as
+    # Streamlit Cloud, process/thread limits are shared at the user level.
+    # A low per-process RLIMIT_NPROC can make subprocess creation fail with
+    # [Errno 11] Resource temporarily unavailable, including when Streamlit
+    # starts its own runtime threads/processes. Wall-clock timeouts below are
+    # the primary execution bound.
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
     except Exception:
         pass
     try:
         resource.setrlimit(resource.RLIMIT_FSIZE, (max_file_bytes, max_file_bytes))
-    except Exception:
-        pass
-    # Keep child/process creation bounded where supported.
-    try:
-        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
     except Exception:
         pass
 
@@ -86,7 +88,7 @@ def run_command(command, workspace: Path, timeout: int):
             start_new_session=(os.name == "posix"),
         )
     except Exception as exc:
-        return {"ok": False, "returncode": -1, "error": str(exc)}
+        return {"ok": False, "returncode": -1, "error": str(exc), "category": "sandbox_infrastructure", "fatal": True}
 
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -190,6 +192,8 @@ def run_streamlit(workspace: Path, target: str, timeout: int):
             "returncode": -1,
             "error": str(exc),
             "mode": "sandbox_streamlit_smoke",
+            "category": "sandbox_infrastructure",
+            "fatal": True,
         }
 
     deadline = time.monotonic() + timeout
@@ -198,7 +202,7 @@ def run_streamlit(workspace: Path, target: str, timeout: int):
             if proc.poll() is not None:
                 stdout, stderr = proc.communicate(timeout=2)
                 combined = (stdout + "\n" + stderr).strip()
-                return {
+                payload = {
                     "ok": False,
                     "mode": "sandbox_streamlit_smoke",
                     "returncode": proc.returncode,
@@ -209,6 +213,11 @@ def run_streamlit(workspace: Path, target: str, timeout: int):
                         "Ensure Streamlit is installed in the deployment requirements."
                     ),
                 }
+                if "No module named streamlit" in combined:
+                    payload["category"] = "sandbox_infrastructure"
+                    payload["fatal"] = True
+                    payload["error"] = "The deployment Python environment cannot import Streamlit."
+                return payload
 
             status = http_ok(f"http://127.0.0.1:{port}/")
             if status is not None:
@@ -245,7 +254,7 @@ def main():
 
     # Apply limits in the runner itself so they are inherited by child
     # processes. This avoids the fragile preexec_fn mechanism.
-    apply_limits(cpu_seconds=max(8, args.timeout - 2), max_file_bytes=8 * 1024 * 1024)
+    apply_limits(cpu_seconds=max(60, args.timeout + 30), max_file_bytes=8 * 1024 * 1024)
 
     if args.mode == "compile":
         result = compile_file(workspace, args.target, args.timeout)
