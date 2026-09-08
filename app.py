@@ -1,11 +1,8 @@
 from __future__ import annotations
-
 import os
 import zipfile
 from pathlib import Path
-
 import streamlit as st
-
 from workflow import DEFAULT_MODEL, STAGES, WorkflowEngine
 
 
@@ -300,7 +297,7 @@ with st.sidebar:
 
 st.markdown(
     """
-    <div class="hero">
+      <div class="hero">
       <div class="kicker">AI SOFTWARE ENGINEERING WORKFLOW</div>
       <div class="title">Build. Test. <span class="gradient">Repair.</span></div>
       <div class="sub">
