@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,7 +29,7 @@ MAX_STAGE_CALLS = 1
 MAX_REPAIR_ATTEMPTS = 2
 MAX_RATE_LIMIT_RETRIES = 2
 MAX_JSON_RETRIES = 2
-MAX_OUTPUT_TOKENS = 2400
+MAX_OUTPUT_TOKENS = 6000
 
 STAGES = [
     ("requirements", "Requirements", "Turn the user request into explicit acceptance criteria."),
@@ -95,7 +96,9 @@ class WorkflowEngine:
         ok: bool,
         result: dict[str, Any],
     ) -> None:
+        # Observable execution trace: record actions/results, not private model reasoning.
         state.events.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "tool": "workflow",
             "detail": detail,
             "ok": ok,
@@ -266,9 +269,39 @@ class WorkflowEngine:
                     # before generation with `json_validate_failed`, even when the
                     # prompt explicitly requests JSON. We enforce JSON in the prompt
                     # and parse/validate it locally instead.
-                    text = response.choices[0].message.content or ""
+                    choice = response.choices[0]
+                    text = choice.message.content or ""
                     if not text.strip():
-                        raise ValueError("LLM returned an empty response.")
+                        finish_reason = getattr(choice, "finish_reason", None)
+                        # Some reasoning-heavy models can consume a small output
+                        # budget without emitting visible content. Retry once with
+                        # a larger budget and a compact JSON-only instruction.
+                        if json_attempt < MAX_JSON_RETRIES:
+                            compact_system = (
+                                "Return the requested JSON object immediately. "
+                                "Do not explain, reason aloud, or use Markdown. "
+                                "Output only valid JSON."
+                            )
+                            compact_user = (
+                                user
+                                + "\n\nURGENT: Output the JSON object now. Keep values concise."
+                            )
+                            response = self.client.chat.completions.create(
+                                model=self.model,
+                                messages=[
+                                    {"role": "system", "content": compact_system},
+                                    {"role": "user", "content": compact_user},
+                                ],
+                                temperature=0,
+                                max_tokens=MAX_OUTPUT_TOKENS,
+                            )
+                            text = response.choices[0].message.content or ""
+                            if text.strip():
+                                return self._parse_json_object(text)
+                        raise ValueError(
+                            "LLM returned an empty response"
+                            + (f" (finish_reason={finish_reason})" if finish_reason else "")
+                        )
                     return self._parse_json_object(text)
 
                 except RateLimitError as exc:
