@@ -958,6 +958,11 @@ Return JSON only:
   "cause": "brief cause",
   "repair_needed": true or false
 }
+Rules:
+- Read the pytest failure output carefully, including the exact expected and actual values.
+- If an existing test asserts an exact old return shape and the requested requirement intentionally adds a new field or changes that contract, classify it as a project/test-contract failure and set repair_needed=true.
+- Do NOT call an intentional requirement change an infrastructure failure.
+- Prefer repairing the affected test expectation when the implementation matches the requirement.
 """,
                     json.dumps(failure_payload)[:MAX_CONTEXT_CHARS],
                     state,
@@ -986,7 +991,7 @@ Return JSON only:
 
                 repair = self.llm_json(
                     """
-You are the repair specialist.
+You are the repair specialist for a software development agent.
 Return focused edits only:
 {
   "edits": [
@@ -995,11 +1000,18 @@ Return focused edits only:
   "notes":"brief"
 }
 Rules:
-- Maximum 2 edits.
+- Maximum 3 edits.
 - Use exact current text from the supplied code.
 - Do not rewrite whole files.
 - Do not modify secret files.
 - Do not create dependency-shadowing files.
+- Read the pytest output before deciding what to change.
+- Preserve all behavior that is outside the requested requirement.
+- If the implementation intentionally adds a field to a returned dictionary and an existing test uses an exact dictionary equality assertion for the old contract, update that test to assert the new required field and keep the existing assertions intact.
+- Do NOT remove the newly required field merely to make an old test pass.
+- If the requirement says to update tests, update/add the focused test rather than weakening the implementation.
+- Never replace a test with a trivial assertion such as `assert True`.
+- Keep completed/open behavior and unrelated tests unchanged.
 """,
                     f"Failure:\n{json.dumps(failure_payload)[:8000]}\n\nCurrent code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
                     state,
