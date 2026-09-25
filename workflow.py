@@ -25,7 +25,8 @@ MAX_CONTEXT_CHARS = 16_000
 
 MAX_STAGE_CALLS = 1
 MAX_REPAIR_ATTEMPTS = 2
-MAX_RATE_LIMIT_RETRIES = 1
+MAX_RATE_LIMIT_RETRIES = 2
+MAX_JSON_RETRIES = 2
 MAX_OUTPUT_TOKENS = 1800
 
 STAGES = [
@@ -203,67 +204,88 @@ class WorkflowEngine:
     # This deliberately avoids the schema failures
     # that were causing repeated 400 errors.
     # -------------------------
+    @staticmethod
+    def _parse_json_object(text: str) -> dict[str, Any]:
+        """Parse a JSON object defensively, including fenced/model-prefixed output."""
+        cleaned = (text or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+        try:
+            value = json.loads(cleaned)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            pass
+
+        # Recover the first complete JSON object when a provider adds prose.
+        decoder = json.JSONDecoder()
+        start = cleaned.find("{")
+        if start >= 0:
+            value, _ = decoder.raw_decode(cleaned[start:])
+            if isinstance(value, dict):
+                return value
+
+        raise ValueError("LLM did not return a valid JSON object.")
+
     def llm_json(
         self,
         system: str,
         user: str,
         state: WorkflowState,
     ) -> dict[str, Any]:
-        last_error = None
+        last_error: Exception | None = None
 
-        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                system
-                                + "\\n\\nIMPORTANT: Return the response as valid JSON. "
-                                  "The response must be a JSON object."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": user
-                            + "\\n\\nReturn valid JSON only. Do not use Markdown fences.",
-                        },
-                    ],
-                    temperature=0,
-                    max_tokens=MAX_OUTPUT_TOKENS,
-                    response_format={"type": "json_object"},
-                )
+        for rate_attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            for json_attempt in range(MAX_JSON_RETRIES + 1):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    system
+                                    + "\n\nIMPORTANT: Return valid JSON. The response must be one JSON object."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": user
+                                + "\n\nReturn JSON only. No Markdown fences or commentary.",
+                            },
+                        ],
+                        temperature=0,
+                        max_tokens=MAX_OUTPUT_TOKENS,
+                        response_format={"type": "json_object"},
+                    )
 
-                text = response.choices[0].message.content or "{}"
-                # Be defensive with provider/model responses.
-                text = text.strip()
-                if text.startswith("```"):
-                    text = re.sub(r"^```(?:json)?\\s*", "", text, flags=re.I)
-                    text = re.sub(r"\\s*```$", "", text)
-                data = json.loads(text)
+                    text = response.choices[0].message.content or "{}"
+                    return self._parse_json_object(text)
 
-                if not isinstance(data, dict):
-                    raise ValueError("LLM returned JSON but not an object.")
+                except RateLimitError as exc:
+                    last_error = exc
+                    break
+                except (json.JSONDecodeError, ValueError) as exc:
+                    last_error = exc
+                    if json_attempt < MAX_JSON_RETRIES:
+                        time.sleep(0.5)
+                        continue
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    break
 
-                return data
-
-            except RateLimitError as exc:
-                last_error = exc
-                if attempt >= MAX_RATE_LIMIT_RETRIES:
+            if isinstance(last_error, RateLimitError):
+                if rate_attempt >= MAX_RATE_LIMIT_RETRIES:
                     raise RuntimeError(
-                        "Groq rate limit remained exceeded after one retry."
-                    ) from exc
+                        "Groq rate limit remained exceeded after retries."
+                    ) from last_error
+                time.sleep(8)
+                continue
 
-                time.sleep(10)
-
-            except json.JSONDecodeError as exc:
-                last_error = exc
-                break
-
-            except Exception as exc:
-                last_error = exc
-                break
+            break
 
         raise RuntimeError(f"Structured LLM response failed: {last_error}")
 
@@ -462,19 +484,22 @@ class WorkflowEngine:
             }
 
         try:
+            env = os.environ.copy()
+            env.update({
+                "PYTHONUNBUFFERED": "1",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            })
+
             proc = subprocess.run(
                 ["python", "-m", "pytest", "-q"],
                 cwd=str(workspace),
                 capture_output=True,
                 text=True,
                 timeout=40,
-                env={
-                    "PATH": os.environ.get("PATH", ""),
-                    "PYTHONUNBUFFERED": "1",
-                    "LANG": "C.UTF-8",
-                    "LC_ALL": "C.UTF-8",
-                },
+                env=env,
             )
+
         except Exception as exc:
             return {
                 "ok": False,
@@ -535,12 +560,7 @@ class WorkflowEngine:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                env={
-                    "PATH": os.environ.get("PATH", ""),
-                    "PYTHONUNBUFFERED": "1",
-                    "LANG": "C.UTF-8",
-                    "LC_ALL": "C.UTF-8",
-                },
+                env={**os.environ, "PYTHONUNBUFFERED": "1", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
             )
 
             deadline = time.time() + 12
@@ -723,6 +743,18 @@ Rules:
             self.event(state, "Implementation applied", True, applied)
             self.update(state, "implementation", "done", f"Changed: {', '.join(applied['changed_files'])}")
 
+            # Refresh code context after implementation. The original implementation
+            # generated tests from pre-edit snippets, which could create tests for code
+            # that no longer existed.
+            current_snippets = []
+            for path in relevant[:8]:
+                try:
+                    current_snippets.append(
+                        f"FILE: {path}\n{self.read_text(state.workspace, path)[:7000]}"
+                    )
+                except Exception:
+                    continue
+
             # 5. Test generation
             self.update(state, "test_generation", "active", "Preparing focused requirement tests")
             test_plan = self.llm_json(
@@ -736,16 +768,19 @@ Return JSON only:
   ]
 }
 Rules:
+- Base tests ONLY on the current post-implementation code supplied below.
 - Keep tests small and deterministic.
-- Prefer pure-Python tests.
+- Prefer testing pure functions/classes instead of importing a Streamlit UI.
 - Do not add dependencies.
+- If the requirement cannot be safely tested without launching the application, return an empty tests list.
+- Never overwrite an existing test file.
 """,
-                f"Requirement:\n{requirement[:5000]}\n\nCurrent relevant code:\n{chr(10).join(snippets)[:MAX_CONTEXT_CHARS]}",
+                f"Requirement:\n{requirement[:5000]}\n\nCurrent post-implementation code:\n{chr(10).join(current_snippets)[:MAX_CONTEXT_CHARS]}",
                 state,
             )
 
-            test_file = str(test_plan.get("test_file", "tests/test_requirement.py"))
             tests = test_plan.get("tests", [])
+            generated_test_file = None
             if isinstance(tests, list) and tests:
                 test_code = "import pytest\n\n"
                 for item in tests[:4]:
@@ -753,14 +788,32 @@ Rules:
                         continue
                     code = item.get("code")
                     if isinstance(code, str) and code.strip():
-                        test_code += code.rstrip() + "\n\n"
+                        code = re.sub(r"^```(?:python)?\s*", "", code.strip(), flags=re.I)
+                        code = re.sub(r"\s*```$", "", code).strip()
+                        test_code += code + "\n\n"
 
                 if test_code.strip() != "import pytest":
-                    target = self.safe_path(state.workspace, test_file)
+                    requested_test_file = str(test_plan.get("test_file", "tests/test_requirement.py"))
+                    if not requested_test_file.startswith("tests/"):
+                        requested_test_file = "tests/test_requirement.py"
+
+                    target = self.safe_path(state.workspace, requested_test_file)
+                    if target.exists():
+                        stem = target.stem
+                        suffix = target.suffix or ".py"
+                        index = 2
+                        while target.exists():
+                            target = target.with_name(f"{stem}_generated_{index}{suffix}")
+                            index += 1
+                        requested_test_file = target.relative_to(state.workspace).as_posix()
+
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(test_code, encoding="utf-8")
-                    state.verification["test_file"] = test_file
-                    self.event(state, "Requirement tests generated", True, {"test_file": test_file})
+                    generated_test_file = requested_test_file
+                    state.verification["test_file"] = generated_test_file
+                    self.event(state, "Requirement tests generated", True, {"test_file": generated_test_file})
+            else:
+                self.event(state, "Requirement tests generated", True, {"test_file": None, "message": "No safe deterministic requirement test was generated."})
 
             self.update(state, "test_generation", "done", "Focused tests prepared")
 
