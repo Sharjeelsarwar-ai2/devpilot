@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import os
@@ -576,6 +577,167 @@ class WorkflowEngine:
             if path and path in output and path not in explicit:
                 explicit.append(path)
         return explicit[:8]
+
+    @staticmethod
+    def deterministic_contract_test_repair(
+        workspace: Path,
+        failure_text: str,
+        requirement: str,
+    ) -> dict[str, Any] | None:
+        """Safely repair stale exact-dict test expectations caused by additive fields.
+
+        This is intentionally narrow and deterministic. It only fires when pytest
+        proves that the implementation returned a dictionary with one or more new
+        keys while the test expected the same dictionary without those keys. The
+        added keys (and string values when present) must also be explicitly supported
+        by the user's requirement. Existing expected keys/values are never changed.
+        """
+        if not failure_text or not requirement:
+            return None
+
+        requirement_lower = requirement.lower()
+
+        # Example pytest location: tests/test_tasks.py:7: AssertionError
+        location_matches = re.findall(
+            r"(?m)^\s*([^\s:]+\.py):(\d+):\s*AssertionError\s*$",
+            failure_text,
+        )
+        if not location_matches:
+            return None
+
+        # Example: At index 0 diff: {'title': '...', 'priority': 'Medium'} != {...}
+        diff_match = re.search(
+            r"At index\s+(\d+)\s+diff:\s*(.+?)\s+!=\s*(.+?)\s*$",
+            failure_text,
+            flags=re.MULTILINE,
+        )
+        if not diff_match:
+            return None
+
+        try:
+            item_index = int(diff_match.group(1))
+            actual_item = ast.literal_eval(diff_match.group(2).strip())
+            expected_item_from_diff = ast.literal_eval(diff_match.group(3).strip())
+        except (ValueError, SyntaxError):
+            return None
+
+        if not isinstance(actual_item, dict) or not isinstance(expected_item_from_diff, dict):
+            return None
+
+        # Only additive dictionary changes are eligible. No existing value may differ.
+        extra_keys = [key for key in actual_item if key not in expected_item_from_diff]
+        if not extra_keys:
+            return None
+        if set(expected_item_from_diff) - set(actual_item):
+            return None
+        for key in expected_item_from_diff:
+            if actual_item.get(key) != expected_item_from_diff.get(key):
+                return None
+
+        # Requirement-gated: do not rewrite an old test merely because the output
+        # happens to contain an extra field. The requested feature must name the
+        # new field, and string values such as "Medium" must also be supported.
+        for key in extra_keys:
+            if str(key).lower() not in requirement_lower:
+                return None
+            value = actual_item[key]
+            if isinstance(value, str) and value.lower() not in requirement_lower:
+                return None
+
+        # Read the implicated test file and find the assertion at/near the pytest
+        # line. Resolve it through the workspace-safe path helper semantics by
+        # rejecting absolute and escaping paths.
+        test_rel, line_text = location_matches[0]
+        try:
+            test_path = (workspace / Path(test_rel)).resolve()
+            workspace_resolved = workspace.resolve()
+            test_path.relative_to(workspace_resolved)
+            source = test_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+
+        try:
+            tree = ast.parse(source)
+            target_line = int(line_text)
+        except (SyntaxError, ValueError):
+            return None
+
+        target_assert = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assert):
+                continue
+            end_line = getattr(node, "end_lineno", node.lineno)
+            if node.lineno <= target_line <= end_line:
+                target_assert = node
+                break
+        if target_assert is None or not isinstance(target_assert.test, ast.Compare):
+            return None
+
+        compare = target_assert.test
+        if len(compare.ops) != 1 or not isinstance(compare.ops[0], ast.Eq) or len(compare.comparators) != 1:
+            return None
+
+        # Prefer the literal side of the equality as the expected value.
+        literal_node = None
+        for candidate in (compare.comparators[0], compare.left):
+            if isinstance(candidate, (ast.List, ast.Tuple, ast.Dict)):
+                literal_node = candidate
+                break
+        if literal_node is None:
+            return None
+
+        try:
+            expected_literal = ast.literal_eval(literal_node)
+        except (ValueError, SyntaxError):
+            return None
+
+        updated_literal = None
+        if (
+            isinstance(expected_literal, list)
+            and 0 <= item_index < len(expected_literal)
+            and isinstance(expected_literal[item_index], dict)
+        ):
+            # Ensure the source expectation exactly matches the diff's expected item
+            # before adding only the proven missing keys.
+            source_expected_item = expected_literal[item_index]
+            if source_expected_item != expected_item_from_diff:
+                return None
+            updated = list(expected_literal)
+            updated_item = dict(source_expected_item)
+            for key in extra_keys:
+                updated_item[key] = actual_item[key]
+            updated[item_index] = updated_item
+            updated_literal = updated
+        elif isinstance(expected_literal, dict) and item_index == 0:
+            if expected_literal != expected_item_from_diff:
+                return None
+            updated_literal = dict(expected_literal)
+            for key in extra_keys:
+                updated_literal[key] = actual_item[key]
+
+        if updated_literal is None:
+            return None
+
+        search = ast.get_source_segment(source, literal_node)
+        if not search:
+            return None
+        replacement = repr(updated_literal)
+        if replacement == search or any(str(key) not in replacement for key in extra_keys):
+            return None
+
+        relative = test_path.relative_to(workspace_resolved).as_posix()
+        return {
+            "edits": [{
+                "path": relative,
+                "search": search,
+                "replace": replacement,
+            }],
+            "notes": (
+                "Deterministically updated a stale exact dictionary test expectation "
+                "to include the requirement-backed additive return field(s): "
+                + ", ".join(map(str, extra_keys))
+            ),
+        }
 
     @staticmethod
     def _pytest_status(pytest_result: dict[str, Any]) -> str:
@@ -1375,8 +1537,30 @@ Rules:
                     except Exception:
                         pass
 
-                repair = self.llm_json(
-                    """
+                # A common safe failure mode is an old exact-dict test contract after
+                # an intentionally additive return field. Handle that narrow pattern
+                # deterministically before asking the LLM to patch tests. This keeps
+                # the agent reliable while remaining strictly requirement-gated.
+                deterministic_repair = self.deterministic_contract_test_repair(
+                    state.workspace,
+                    failure_text,
+                    requirement,
+                )
+
+                if deterministic_repair:
+                    repair = deterministic_repair
+                    self.event(
+                        state,
+                        "Deterministic test-contract repair selected",
+                        True,
+                        {
+                            "changed_area": "stale exact dictionary assertion",
+                            "notes": repair.get("notes", ""),
+                        },
+                    )
+                else:
+                    repair = self.llm_json(
+                        """
 You are the repair specialist for a closed-loop software development agent.
 Return focused edits only:
 {
@@ -1400,9 +1584,9 @@ Rules:
 - Keep completed/open behavior and unrelated tests unchanged.
 - Prefer the smallest patch that addresses the diagnosed cause.
 """,
-                    f"Failure analysis:\n{json.dumps(analysis)[:7000]}\n\nLatest failure evidence:\n{failure_text[:7000]}\n\nCurrent focused code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
-                    state,
-                )
+                        f"Failure analysis:\n{json.dumps(analysis)[:7000]}\n\nLatest failure evidence:\n{failure_text[:7000]}\n\nCurrent focused code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
+                        state,
+                    )
 
                 repair_edits = self.normalize_edits(repair)
                 repair_result = self.apply_edits(state.workspace, repair_edits)
