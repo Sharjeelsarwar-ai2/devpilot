@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from datetime import datetime
 import zipfile
 from pathlib import Path
 import streamlit as st
@@ -179,6 +180,30 @@ st.markdown(
     .metric-value { font-size: 1.38rem; font-weight: 800; }
     .metric-label { font-size: .72rem; color: rgba(255,255,255,.45); }
 
+    .trace-card {
+        display: flex;
+        gap: .75rem;
+        align-items: flex-start;
+        padding: .7rem .8rem;
+        margin: .38rem 0;
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,.07);
+        background: rgba(255,255,255,.025);
+    }
+    .trace-dot {
+        width: 9px; height: 9px; border-radius: 50%;
+        flex: 0 0 9px; margin-top: .34rem;
+        background: #50d296;
+        box-shadow: 0 0 12px rgba(80,210,150,.35);
+    }
+    .trace-dot.fail {
+        background: #ff7777;
+        box-shadow: 0 0 12px rgba(255,119,119,.35);
+    }
+    .trace-time { font-size: .65rem; color: rgba(255,255,255,.34); margin-bottom: .12rem; }
+    .trace-action { font-size: .78rem; color: rgba(255,255,255,.84); font-weight: 600; }
+    .trace-result { font-size: .68rem; color: rgba(255,255,255,.43); margin-top: .12rem; line-height: 1.45; }
+
     [data-testid="stFileUploaderDropzone"] {
         background: rgba(255,255,255,.025) !important;
         border: 1px dashed rgba(255,255,255,.16) !important;
@@ -255,6 +280,57 @@ def render_workflow(state, progress_slot, status_slot, timeline_slot):
         status_slot.success("Development run verified")
     else:
         status_slot.markdown("**Status:** Waiting")
+
+
+def render_agent_trace(state, trace_slot, limit=40):
+    """Render observable agent actions without exposing private chain-of-thought."""
+    events = state.events[-limit:]
+    if not events:
+        trace_slot.markdown(
+            "<div class='section-sub'>Waiting for the first agent action...</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    rows = []
+    for event in events:
+        timestamp = str(event.get("timestamp", ""))
+        if timestamp:
+            try:
+                timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+            except ValueError:
+                timestamp = timestamp[-8:]
+        else:
+            timestamp = "--:--:--"
+
+        result = event.get("result", {})
+        if isinstance(result, dict):
+            if "changed_files" in result:
+                summary = "Changed: " + ", ".join(map(str, result.get("changed_files") or []))
+            elif "pytest" in result and isinstance(result.get("pytest"), dict):
+                pr = result["pytest"]
+                summary = str(pr.get("summary") or pr.get("message") or pr.get("error") or "Test execution completed")
+            elif "message" in result:
+                summary = str(result["message"])
+            elif "cause" in result:
+                summary = str(result["cause"])
+            else:
+                summary = "Action completed" if event.get("ok") else "Action reported a failure"
+        else:
+            summary = str(result)
+
+        summary = summary.replace("<", "&lt;").replace(">", "&gt;")[:220]
+        detail = str(event.get("detail", "Agent action"))
+        detail = detail.replace("<", "&lt;").replace(">", "&gt;")
+        dot_class = "" if event.get("ok") else " fail"
+        rows.append(
+            f"<div class='trace-card'><div class='trace-dot{dot_class}'></div>"
+            f"<div><div class='trace-time'>{timestamp}</div>"
+            f"<div class='trace-action'>{detail}</div>"
+            f"<div class='trace-result'>{summary}</div></div></div>"
+        )
+
+    trace_slot.markdown("".join(rows), unsafe_allow_html=True)
 
 
 with st.sidebar:
@@ -372,8 +448,11 @@ if run_clicked:
     progress_slot = st.empty()
     status_slot = st.empty()
     timeline_slot = st.empty()
+    st.markdown("### 🧠 Agent Trace")
+    trace_slot = st.empty()
 
     progress_slot.progress(0, text="Workflow progress · 0%")
+    render_agent_trace(type("TraceState", (), {"events": []})(), trace_slot)
 
     def on_update(state):
         render_workflow(
@@ -382,6 +461,7 @@ if run_clicked:
             status_slot,
             timeline_slot,
         )
+        render_agent_trace(state, trace_slot)
 
     engine = WorkflowEngine(
         api_key=api_key,
@@ -398,6 +478,7 @@ if run_clicked:
         status_slot,
         timeline_slot,
     )
+    render_agent_trace(state, trace_slot)
 
     st.divider()
 
