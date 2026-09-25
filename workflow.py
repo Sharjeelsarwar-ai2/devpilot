@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import difflib
 import json
 import os
@@ -49,7 +48,6 @@ STAGES = [
 @dataclass
 class WorkflowState:
     workspace: Path | None = None
-    requirement: str = ""
     stage_state: dict[str, str] = field(
         default_factory=lambda: {k: "pending" for k, _, _ in STAGES}
     )
@@ -59,9 +57,6 @@ class WorkflowState:
     events: list[dict[str, Any]] = field(default_factory=list)
     repair_attempts: int = 0
     repair_history: list[dict[str, Any]] = field(default_factory=list)
-    changed_files: list[str] = field(default_factory=list)
-    verification_history: list[dict[str, Any]] = field(default_factory=list)
-    engineering_report: dict[str, Any] = field(default_factory=dict)
     aborted: bool = False
     abort_reason: str = ""
     final_report: str = ""
@@ -578,348 +573,6 @@ class WorkflowEngine:
                 explicit.append(path)
         return explicit[:8]
 
-    @staticmethod
-    def deterministic_contract_test_repair(
-        workspace: Path,
-        failure_text: str,
-        requirement: str,
-    ) -> dict[str, Any] | None:
-        """Safely repair stale exact-dict test expectations caused by additive fields.
-
-        This is intentionally narrow and deterministic. It only fires when pytest
-        proves that the implementation returned a dictionary with one or more new
-        keys while the test expected the same dictionary without those keys. The
-        added keys (and string values when present) must also be explicitly supported
-        by the user's requirement. Existing expected keys/values are never changed.
-        """
-        if not failure_text or not requirement:
-            return None
-
-        requirement_lower = requirement.lower()
-
-        # Example pytest location: tests/test_tasks.py:7: AssertionError
-        location_matches = re.findall(
-            r"(?m)^\s*([^\s:]+\.py):(\d+):\s*AssertionError\s*$",
-            failure_text,
-        )
-        if not location_matches:
-            return None
-
-        # Example: At index 0 diff: {'title': '...', 'priority': 'Medium'} != {...}
-        diff_match = re.search(
-            r"At index\s+(\d+)\s+diff:\s*(.+?)\s+!=\s*(.+?)\s*$",
-            failure_text,
-            flags=re.MULTILINE,
-        )
-        if not diff_match:
-            return None
-
-        try:
-            item_index = int(diff_match.group(1))
-            actual_item = ast.literal_eval(diff_match.group(2).strip())
-            expected_item_from_diff = ast.literal_eval(diff_match.group(3).strip())
-        except (ValueError, SyntaxError):
-            return None
-
-        if not isinstance(actual_item, dict) or not isinstance(expected_item_from_diff, dict):
-            return None
-
-        # Only additive dictionary changes are eligible. No existing value may differ.
-        extra_keys = [key for key in actual_item if key not in expected_item_from_diff]
-        if not extra_keys:
-            return None
-        if set(expected_item_from_diff) - set(actual_item):
-            return None
-        for key in expected_item_from_diff:
-            if actual_item.get(key) != expected_item_from_diff.get(key):
-                return None
-
-        # Requirement-gated: do not rewrite an old test merely because the output
-        # happens to contain an extra field. The requested feature must name the
-        # new field, and string values such as "Medium" must also be supported.
-        for key in extra_keys:
-            if str(key).lower() not in requirement_lower:
-                return None
-            value = actual_item[key]
-            if isinstance(value, str) and value.lower() not in requirement_lower:
-                return None
-
-        # Read the implicated test file and find the assertion at/near the pytest
-        # line. Resolve it through the workspace-safe path helper semantics by
-        # rejecting absolute and escaping paths.
-        test_rel, line_text = location_matches[0]
-        try:
-            test_path = (workspace / Path(test_rel)).resolve()
-            workspace_resolved = workspace.resolve()
-            test_path.relative_to(workspace_resolved)
-            source = test_path.read_text(encoding="utf-8")
-        except (OSError, ValueError):
-            return None
-
-        try:
-            tree = ast.parse(source)
-            target_line = int(line_text)
-        except (SyntaxError, ValueError):
-            return None
-
-        target_assert = None
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assert):
-                continue
-            end_line = getattr(node, "end_lineno", node.lineno)
-            if node.lineno <= target_line <= end_line:
-                target_assert = node
-                break
-        if target_assert is None or not isinstance(target_assert.test, ast.Compare):
-            return None
-
-        compare = target_assert.test
-        if len(compare.ops) != 1 or not isinstance(compare.ops[0], ast.Eq) or len(compare.comparators) != 1:
-            return None
-
-        # Prefer the literal side of the equality as the expected value.
-        literal_node = None
-        for candidate in (compare.comparators[0], compare.left):
-            if isinstance(candidate, (ast.List, ast.Tuple, ast.Dict)):
-                literal_node = candidate
-                break
-        if literal_node is None:
-            return None
-
-        try:
-            expected_literal = ast.literal_eval(literal_node)
-        except (ValueError, SyntaxError):
-            return None
-
-        updated_literal = None
-        if (
-            isinstance(expected_literal, list)
-            and 0 <= item_index < len(expected_literal)
-            and isinstance(expected_literal[item_index], dict)
-        ):
-            # Ensure the source expectation exactly matches the diff's expected item
-            # before adding only the proven missing keys.
-            source_expected_item = expected_literal[item_index]
-            if source_expected_item != expected_item_from_diff:
-                return None
-            updated = list(expected_literal)
-            updated_item = dict(source_expected_item)
-            for key in extra_keys:
-                updated_item[key] = actual_item[key]
-            updated[item_index] = updated_item
-            updated_literal = updated
-        elif isinstance(expected_literal, dict) and item_index == 0:
-            if expected_literal != expected_item_from_diff:
-                return None
-            updated_literal = dict(expected_literal)
-            for key in extra_keys:
-                updated_literal[key] = actual_item[key]
-
-        if updated_literal is None:
-            return None
-
-        search = ast.get_source_segment(source, literal_node)
-        if not search:
-            return None
-        replacement = repr(updated_literal)
-        if replacement == search or any(str(key) not in replacement for key in extra_keys):
-            return None
-
-        relative = test_path.relative_to(workspace_resolved).as_posix()
-        return {
-            "edits": [{
-                "path": relative,
-                "search": search,
-                "replace": replacement,
-            }],
-            "notes": (
-                "Deterministically updated a stale exact dictionary test expectation "
-                "to include the requirement-backed additive return field(s): "
-                + ", ".join(map(str, extra_keys))
-            ),
-        }
-
-    @staticmethod
-    def _pytest_status(pytest_result: dict[str, Any]) -> str:
-        """Create a compact factual pytest status for the engineering report."""
-        if not isinstance(pytest_result, dict):
-            return "Not run"
-
-        message = str(pytest_result.get("message", "") or "").strip()
-        if pytest_result.get("ok"):
-            output = "\n".join(
-                [
-                    str(pytest_result.get("stdout", "") or ""),
-                    str(pytest_result.get("stderr", "") or ""),
-                ]
-            ).strip()
-            match = re.findall(r"([^\n]*\bpassed\b[^\n]*)", output, flags=re.I)
-            return (match[-1].strip() if match else message) or "Passed"
-
-        error = str(pytest_result.get("error", "") or "").strip()
-        if pytest_result.get("error_type") == "infrastructure":
-            return f"Infrastructure failure: {error or message or 'pytest unavailable'}"
-
-        output = WorkflowEngine.failed_test_output(pytest_result, limit=700)
-        summary_lines = [line.strip() for line in output.splitlines() if line.strip()]
-        if summary_lines:
-            return summary_lines[-1]
-        return error or message or "Failed"
-
-    @staticmethod
-    def _verification_label(entry: dict[str, Any]) -> str:
-        return str(entry.get("label", "verification"))
-
-    def record_verification(
-        self,
-        state: WorkflowState,
-        label: str,
-        verification: dict[str, Any],
-    ) -> None:
-        """Persist a compact verification history for before/after reporting."""
-        state.verification_history.append({
-            "label": label,
-            "ok": bool(verification.get("ok")),
-            "quality": list(verification.get("quality", ())),
-            "compile": verification.get("compile", {}),
-            "pytest": verification.get("pytest", {}),
-        })
-
-    def build_engineering_report(self, state: WorkflowState, requirement: str) -> dict[str, Any]:
-        """Build a deterministic engineering report from observed workflow state.
-
-        This report is deliberately derived from execution records rather than
-        model-generated claims, so files/tests/repair/sandbox facts remain truthful.
-        """
-        before = None
-        after = None
-        for item in state.verification_history:
-            label = self._verification_label(item)
-            if label == "before_repair":
-                before = item
-            elif label.startswith("after_repair_") and item.get("ok"):
-                after = item
-
-        if after is None:
-            for item in reversed(state.verification_history):
-                if item.get("ok") and self._verification_label(item).startswith("after_"):
-                    after = item
-                    break
-
-        final_tests = state.verification.get("final_tests")
-        if after is None and isinstance(final_tests, dict):
-            after = {
-                "label": "final_tests",
-                "ok": bool(final_tests.get("ok")),
-                "quality": list(final_tests.get("quality", ())),
-                "compile": final_tests.get("compile", {}),
-                "pytest": final_tests.get("pytest", {}),
-            }
-
-        repair_rows = []
-        for item in state.repair_history:
-            repair_rows.append({
-                "attempt": item.get("attempt"),
-                "changed_files": item.get("changed_files", []),
-                "status": item.get("status", "unknown"),
-                "before_quality": item.get("before_quality"),
-                "after_quality": item.get("after_quality"),
-                "rollback_verified": item.get("rollback_verified"),
-            })
-
-        sandbox = state.verification.get("sandbox", {})
-
-        report = {
-            "requirement": requirement[:4000],
-            "changed_files": sorted(set(state.changed_files)),
-            "tests_before_repair": before,
-            "tests_after_repair": after,
-            "verification_history": list(state.verification_history),
-            "repair_attempts": state.repair_attempts,
-            "repair_history": repair_rows,
-            "sandbox_verification": sandbox,
-            "overall_verified": bool(
-                not state.aborted
-                and isinstance(sandbox, dict)
-                and sandbox.get("ok") is True
-                and isinstance(final_tests, dict)
-                and final_tests.get("ok") is True
-            ),
-        }
-
-        state.engineering_report = report
-        state.verification["engineering_report"] = report
-        return report
-
-    @staticmethod
-    def render_engineering_report(report: dict[str, Any]) -> str:
-        """Render the deterministic engineering report as compact Markdown."""
-        changed = report.get("changed_files") or []
-        before = report.get("tests_before_repair") or {}
-        after = report.get("tests_after_repair") or {}
-        sandbox = report.get("sandbox_verification") or {}
-        repairs = report.get("repair_history") or []
-
-        lines = [
-            "## Engineering Verification Report",
-            "",
-            "### Changed files",
-        ]
-        if changed:
-            lines.extend(f"- `{path}`" for path in changed)
-        else:
-            lines.append("- None recorded")
-
-        lines.extend([
-            "",
-            "### Verification before repair",
-            f"- Result: **{'PASSED' if before.get('ok') else 'FAILED' if before else 'Not recorded'}**",
-        ])
-        if before:
-            lines.append(f"- Pytest: {WorkflowEngine._pytest_status(before.get('pytest', {}))}")
-
-        lines.extend([
-            "",
-            "### Verification after repair",
-            f"- Result: **{'PASSED' if after.get('ok') else 'FAILED' if after else 'Not recorded'}**",
-        ])
-        if after:
-            lines.append(f"- Pytest: {WorkflowEngine._pytest_status(after.get('pytest', {}))}")
-
-        lines.extend([
-            "",
-            "### Repair attempts",
-            f"- Total attempts: **{report.get('repair_attempts', 0)}**",
-        ])
-        if repairs:
-            for item in repairs:
-                status = str(item.get("status", "unknown")).replace("_", " ")
-                files = ", ".join(f"`{x}`" for x in item.get("changed_files", [])) or "no files recorded"
-                rollback = item.get("rollback_verified")
-                suffix = " · rollback verified" if rollback is True else ""
-                lines.append(f"- Attempt {item.get('attempt')}: **{status}** · {files}{suffix}")
-        else:
-            lines.append("- No repair was required.")
-
-        lines.extend([
-            "",
-            "### Sandbox verification",
-            f"- Result: **{'PASSED' if sandbox.get('ok') else 'FAILED' if sandbox else 'Not run'}**",
-        ])
-        if sandbox.get("mode"):
-            lines.append(f"- Mode: `{sandbox.get('mode')}`")
-        if sandbox.get("http_status") is not None:
-            lines.append(f"- HTTP status: `{sandbox.get('http_status')}`")
-        if sandbox.get("error"):
-            lines.append(f"- Error: `{str(sandbox.get('error'))[:500]}`")
-
-        lines.extend([
-            "",
-            f"### Overall result",
-            f"**{'VERIFIED' if report.get('overall_verified') else 'NOT VERIFIED'}**",
-        ])
-        return "\n".join(lines)
-
     def verify_project(self, workspace: Path) -> dict[str, Any]:
         """Run the deterministic verification stack once and return both results."""
         compile_result = self.compile_project(workspace)
@@ -1180,7 +833,7 @@ class WorkflowEngine:
     # Workflow stages
     # -------------------------
     def run(self, uploaded_file, requirement: str) -> WorkflowState:
-        state = WorkflowState(requirement=requirement[:5000])
+        state = WorkflowState()
 
         try:
             state.workspace = self.extract(uploaded_file)
@@ -1299,10 +952,6 @@ Rules:
                 self.fail(state, "Implementation produced no valid matching edits.", "implementation")
                 return self._finish(state)
 
-            for path in applied["changed_files"]:
-                if path not in state.changed_files:
-                    state.changed_files.append(path)
-
             self.event(state, "Implementation applied", True, applied)
             self.update(state, "implementation", "done", f"Changed: {', '.join(applied['changed_files'])}")
 
@@ -1373,8 +1022,6 @@ Rules:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(test_code, encoding="utf-8")
                     generated_test_file = requested_test_file
-                    if generated_test_file not in state.changed_files:
-                        state.changed_files.append(generated_test_file)
                     state.verification["test_file"] = generated_test_file
                     self.event(state, "Requirement tests generated", True, {"test_file": generated_test_file})
             else:
@@ -1388,7 +1035,6 @@ Rules:
             # is rolled back before another strategy is attempted.
             verification = self.verify_project(state.workspace)
             state.verification["initial_verification"] = verification
-            self.record_verification(state, "before_repair", verification)
 
             for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
                 compile_result = verification["compile"]
@@ -1413,7 +1059,6 @@ Rules:
                 )
 
                 if testing_ok:
-                    state.verification["final_tests"] = verification
                     self.update(state, "testing", "done", "Compile and tests passed")
                     self.update(state, "failure_analysis", "skipped", "No test failures")
                     if state.repair_attempts:
@@ -1526,8 +1171,6 @@ Rules:
                     f"Repair attempt {attempt + 1} of {MAX_REPAIR_ATTEMPTS}",
                 )
 
-                changed_files_before_attempt = set(state.changed_files)
-
                 current_code = []
                 for path in focused:
                     try:
@@ -1537,30 +1180,8 @@ Rules:
                     except Exception:
                         pass
 
-                # A common safe failure mode is an old exact-dict test contract after
-                # an intentionally additive return field. Handle that narrow pattern
-                # deterministically before asking the LLM to patch tests. This keeps
-                # the agent reliable while remaining strictly requirement-gated.
-                deterministic_repair = self.deterministic_contract_test_repair(
-                    state.workspace,
-                    failure_text,
-                    requirement,
-                )
-
-                if deterministic_repair:
-                    repair = deterministic_repair
-                    self.event(
-                        state,
-                        "Deterministic test-contract repair selected",
-                        True,
-                        {
-                            "changed_area": "stale exact dictionary assertion",
-                            "notes": repair.get("notes", ""),
-                        },
-                    )
-                else:
-                    repair = self.llm_json(
-                        """
+                repair = self.llm_json(
+                    """
 You are the repair specialist for a closed-loop software development agent.
 Return focused edits only:
 {
@@ -1584,9 +1205,9 @@ Rules:
 - Keep completed/open behavior and unrelated tests unchanged.
 - Prefer the smallest patch that addresses the diagnosed cause.
 """,
-                        f"Failure analysis:\n{json.dumps(analysis)[:7000]}\n\nLatest failure evidence:\n{failure_text[:7000]}\n\nCurrent focused code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
-                        state,
-                    )
+                    f"Failure analysis:\n{json.dumps(analysis)[:7000]}\n\nLatest failure evidence:\n{failure_text[:7000]}\n\nCurrent focused code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
+                    state,
+                )
 
                 repair_edits = self.normalize_edits(repair)
                 repair_result = self.apply_edits(state.workspace, repair_edits)
@@ -1595,10 +1216,6 @@ Rules:
                 if not repair_result["changed_files"]:
                     self.fail(state, "Repair stage produced no valid matching edits.", "repair")
                     return self._finish(state)
-
-                for path in repair_result["changed_files"]:
-                    if path not in state.changed_files:
-                        state.changed_files.append(path)
 
                 state.verification["repair_candidate"] = {
                     "attempt": state.repair_attempts,
@@ -1618,11 +1235,6 @@ Rules:
                 # Immediate retest closes the agentic loop and gives the next
                 # diagnosis concrete evidence from the exact repair just made.
                 post_repair = self.verify_project(state.workspace)
-                self.record_verification(
-                    state,
-                    f"after_repair_{state.repair_attempts}",
-                    post_repair,
-                )
                 self.event(
                     state,
                     f"Retest after repair {state.repair_attempts}",
@@ -1671,11 +1283,6 @@ Rules:
                     )
 
                     restored_verification = self.verify_project(state.workspace)
-                    self.record_verification(
-                        state,
-                        f"after_rollback_{state.repair_attempts}",
-                        restored_verification,
-                    )
                     rollback_ok = rollback["ok"] and (
                         restored_verification["quality"] == before_quality
                     )
@@ -1708,7 +1315,6 @@ Rules:
                         )
                         return self._finish(state)
 
-                    state.changed_files = sorted(changed_files_before_attempt)
                     verification = restored_verification
                 else:
                     state.repair_history.append({
@@ -1752,17 +1358,13 @@ Rules:
             self.event(state, "Sandbox verification", smoke.get("ok", False), smoke)
 
             if not smoke.get("ok", False):
-                self.build_engineering_report(state, requirement)
                 self.fail(state, f"Sandbox verification failed: {smoke.get('error', 'unknown error')}", "sandbox")
                 return self._finish(state)
 
             self.update(state, "sandbox", "done", "Application responded successfully")
 
             # 10. Final report
-            engineering_report = self.build_engineering_report(state, requirement)
-            engineering_markdown = self.render_engineering_report(engineering_report)
-
-            self.update(state, "final_report", "active", "Preparing verified engineering report")
+            self.update(state, "final_report", "active", "Preparing verified report")
             final = self.llm_json(
                 """
 You are the final-report specialist.
@@ -1772,22 +1374,20 @@ Return JSON only:
   "verified": true or false
 }
 Never claim verification that is not present in the supplied results.
-Mention changed files, tests before/after repair, every repair attempt, rollback events if any, and sandbox status.
-The deterministic engineering report supplied in the input is the source of truth.
+Mention changed files, tests and sandbox status.
 """,
                 json.dumps({
                     "requirement": requirement[:4000],
-                    "engineering_report": engineering_report,
                     "verification": state.verification,
+                    "repair_history": state.repair_history,
                     "events": state.events[-12:],
                 })[:MAX_CONTEXT_CHARS],
                 state,
             )
 
             if final.get("verified") is True:
-                narrative = str(final.get("report", "Development run verified."))
-                state.final_report = narrative.rstrip() + "\n\n" + engineering_markdown
-                self.update(state, "final_report", "done", "Verified engineering report generated")
+                state.final_report = str(final.get("report", "Development run verified."))
+                self.update(state, "final_report", "done", "Verified final report generated")
             else:
                 self.fail(state, "Final report could not establish verified completion.", "final_report")
 
@@ -1805,15 +1405,6 @@ The deterministic engineering report supplied in the input is the source of trut
         return "final_report"
 
     def _finish(self, state: WorkflowState) -> WorkflowState:
-        # Feature 3: always preserve a factual engineering report, even when the
-        # workflow stops early. The report is derived from observed state and never
-        # asks the model to invent execution facts.
-        report = state.engineering_report
-        if not report:
-            report = self.build_engineering_report(state, state.requirement)
-
-        engineering_markdown = self.render_engineering_report(report)
-
         if state.aborted:
             if not state.final_report:
                 state.final_report = (
@@ -1823,9 +1414,6 @@ The deterministic engineering report supplied in the input is the source of trut
                 )
         elif not state.final_report:
             state.final_report = "## Result\n\nDevelopment run completed."
-
-        if "## Engineering Verification Report" not in state.final_report:
-            state.final_report = state.final_report.rstrip() + "\n\n" + engineering_markdown
 
         if self.callback:
             self.callback(state)
