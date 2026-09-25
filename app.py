@@ -448,8 +448,11 @@ if run_clicked:
     progress_slot = st.empty()
     status_slot = st.empty()
     timeline_slot = st.empty()
-    st.markdown("### 🧠 Agent Trace")
-    trace_slot = st.empty()
+
+    # Keep the live agent trace in the sidebar so it never competes with
+    # the main workflow, results, or modified-project panels.
+    trace_panel = st.sidebar.expander("🧠 Agent Trace", expanded=True)
+    trace_slot = trace_panel.empty()
 
     progress_slot.progress(0, text="Workflow progress · 0%")
     render_agent_trace(type("TraceState", (), {"events": []})(), trace_slot)
@@ -542,8 +545,5 @@ if run_clicked:
                 use_container_width=True,
             )
 
-    with st.expander("Detailed workflow activity"):
-        for i, event in enumerate(state.events, 1):
-            icon = "✅" if event["ok"] else "❌"
-            st.markdown(f"**{icon} {i}. {event['detail']}**")
-            st.json(event["result"])
+    # The live Agent Trace is intentionally kept in the sidebar.
+    # The main panel stays focused on workflow status, metrics, report, and artifact.
