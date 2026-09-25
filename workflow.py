@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -497,8 +498,52 @@ class WorkflowEngine:
                 "LC_ALL": "C.UTF-8",
             })
 
+            # DevPilot may run in an environment where pytest is not installed
+            # even though the uploaded project contains pytest tests. Check the
+            # same Python interpreter that will execute the tests, and install
+            # pytest only when it is missing. This keeps the project itself
+            # unchanged and avoids the misleading "No module named pytest"
+            # testing failure.
+            python_executable = sys.executable or "python"
+            pytest_check = subprocess.run(
+                [python_executable, "-c", "import pytest"],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+            )
+
+            if pytest_check.returncode != 0:
+                install = subprocess.run(
+                    [
+                        python_executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--disable-pip-version-check",
+                        "--no-input",
+                        "pytest",
+                    ],
+                    cwd=str(workspace),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env=env,
+                )
+
+                if install.returncode != 0:
+                    return {
+                        "ok": False,
+                        "mode": "pytest",
+                        "error_type": "infrastructure",
+                        "error": "pytest is not installed and could not be installed automatically.",
+                        "install_stdout": (install.stdout or "")[-3000:],
+                        "install_stderr": (install.stderr or "")[-3000:],
+                    }
+
             proc = subprocess.run(
-                ["python", "-m", "pytest", "-q"],
+                [python_executable, "-m", "pytest", "-q"],
                 cwd=str(workspace),
                 capture_output=True,
                 text=True,
