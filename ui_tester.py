@@ -270,6 +270,46 @@ def _execute_step(page, step: dict[str, Any], base_url: str) -> str:
 
 
 
+def _browser_launch_mode() -> tuple[bool, str]:
+    """Choose whether the Playwright browser should be visibly headed or headless.
+
+    DEVPILOT_BROWSER_MODE can be:
+      - headed: force a visible browser (local desktop only)
+      - headless: force background browser testing
+      - auto: headed on a local desktop, headless on CI/server environments
+    """
+    mode = os.getenv("DEVPILOT_BROWSER_MODE", "auto").strip().lower()
+    if mode not in {"auto", "headed", "headless"}:
+        mode = "auto"
+
+    if mode == "headless":
+        return True, "headless"
+
+    if mode == "headed":
+        # A headed browser needs a desktop/display. On Linux without DISPLAY,
+        # safely fall back to headless rather than crashing the workflow.
+        if os.name == "nt" or os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"):
+            return False, "headed"
+        return True, "headless_fallback_no_display"
+
+    # Auto mode: visible on a local Windows/macOS/Linux desktop; background
+    # in CI or server-only environments.
+    if os.getenv("CI", "").strip().lower() in {"1", "true", "yes"}:
+        return True, "headless_ci"
+    if os.name == "nt" or os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"):
+        return False, "headed_auto"
+    return True, "headless_server"
+
+
+def _browser_hold_ms() -> int:
+    """How long to keep a headed test page visible after each successful test."""
+    raw = os.getenv("DEVPILOT_BROWSER_HOLD_MS", "1500").strip()
+    try:
+        return max(0, min(int(raw), 10000))
+    except ValueError:
+        return 1500
+
+
 def _ensure_chromium(p) -> tuple[bool, str]:
     """Launch Chromium once; install its browser binary only if it is missing."""
     try:
@@ -402,15 +442,31 @@ def run_browser_ui_tests(
                 "error": browser_message,
             }
 
+        headless, browser_mode = _browser_launch_mode()
         try:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=headless)
         except Exception as exc:
-            return {
-                "ok": False,
-                "mode": "playwright",
-                "error_type": "infrastructure",
-                "error": f"Chromium could not be launched: {str(exc)[:1200]}",
-            }
+            # If headed mode cannot start (for example, a restricted desktop),
+            # fall back to headless so functional verification is still attempted.
+            if not headless:
+                try:
+                    browser = p.chromium.launch(headless=True)
+                    headless = True
+                    browser_mode = browser_mode + ":headless_fallback"
+                except Exception as fallback_exc:
+                    return {
+                        "ok": False,
+                        "mode": "playwright",
+                        "error_type": "infrastructure",
+                        "error": f"Chromium could not be launched headed or headless: {str(fallback_exc)[:1200]}",
+                    }
+            else:
+                return {
+                    "ok": False,
+                    "mode": "playwright",
+                    "error_type": "infrastructure",
+                    "error": f"Chromium could not be launched: {str(exc)[:1200]}",
+                }
 
         try:
             context = browser.new_context(
@@ -483,6 +539,8 @@ def run_browser_ui_tests(
                     if test_result["ok"]:
                         test_result["console_errors"] = console_errors[-10:]
                         test_result["page_errors"] = page_errors[-10:]
+                        if not headless:
+                            page.wait_for_timeout(_browser_hold_ms())
                     results.append(test_result)
                     page.close()
 
@@ -491,6 +549,7 @@ def run_browser_ui_tests(
             return {
                 "ok": failed == 0,
                 "mode": "playwright",
+                "browser_mode": browser_mode,
                 "message": browser_message,
                 "tests_run": len(results),
                 "tests_passed": passed,
