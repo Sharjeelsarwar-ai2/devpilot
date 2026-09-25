@@ -48,6 +48,7 @@ STAGES = [
 @dataclass
 class WorkflowState:
     workspace: Path | None = None
+    requirement: str = ""
     stage_state: dict[str, str] = field(
         default_factory=lambda: {k: "pending" for k, _, _ in STAGES}
     )
@@ -57,6 +58,9 @@ class WorkflowState:
     events: list[dict[str, Any]] = field(default_factory=list)
     repair_attempts: int = 0
     repair_history: list[dict[str, Any]] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
+    verification_history: list[dict[str, Any]] = field(default_factory=list)
+    engineering_report: dict[str, Any] = field(default_factory=dict)
     aborted: bool = False
     abort_reason: str = ""
     final_report: str = ""
@@ -573,6 +577,187 @@ class WorkflowEngine:
                 explicit.append(path)
         return explicit[:8]
 
+    @staticmethod
+    def _pytest_status(pytest_result: dict[str, Any]) -> str:
+        """Create a compact factual pytest status for the engineering report."""
+        if not isinstance(pytest_result, dict):
+            return "Not run"
+
+        message = str(pytest_result.get("message", "") or "").strip()
+        if pytest_result.get("ok"):
+            output = "\n".join(
+                [
+                    str(pytest_result.get("stdout", "") or ""),
+                    str(pytest_result.get("stderr", "") or ""),
+                ]
+            ).strip()
+            match = re.findall(r"([^\n]*\bpassed\b[^\n]*)", output, flags=re.I)
+            return (match[-1].strip() if match else message) or "Passed"
+
+        error = str(pytest_result.get("error", "") or "").strip()
+        if pytest_result.get("error_type") == "infrastructure":
+            return f"Infrastructure failure: {error or message or 'pytest unavailable'}"
+
+        output = WorkflowEngine.failed_test_output(pytest_result, limit=700)
+        summary_lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if summary_lines:
+            return summary_lines[-1]
+        return error or message or "Failed"
+
+    @staticmethod
+    def _verification_label(entry: dict[str, Any]) -> str:
+        return str(entry.get("label", "verification"))
+
+    def record_verification(
+        self,
+        state: WorkflowState,
+        label: str,
+        verification: dict[str, Any],
+    ) -> None:
+        """Persist a compact verification history for before/after reporting."""
+        state.verification_history.append({
+            "label": label,
+            "ok": bool(verification.get("ok")),
+            "quality": list(verification.get("quality", ())),
+            "compile": verification.get("compile", {}),
+            "pytest": verification.get("pytest", {}),
+        })
+
+    def build_engineering_report(self, state: WorkflowState, requirement: str) -> dict[str, Any]:
+        """Build a deterministic engineering report from observed workflow state.
+
+        This report is deliberately derived from execution records rather than
+        model-generated claims, so files/tests/repair/sandbox facts remain truthful.
+        """
+        before = None
+        after = None
+        for item in state.verification_history:
+            label = self._verification_label(item)
+            if label == "before_repair":
+                before = item
+            elif label.startswith("after_repair_") and item.get("ok"):
+                after = item
+
+        if after is None:
+            for item in reversed(state.verification_history):
+                if item.get("ok") and self._verification_label(item).startswith("after_"):
+                    after = item
+                    break
+
+        final_tests = state.verification.get("final_tests")
+        if after is None and isinstance(final_tests, dict):
+            after = {
+                "label": "final_tests",
+                "ok": bool(final_tests.get("ok")),
+                "quality": list(final_tests.get("quality", ())),
+                "compile": final_tests.get("compile", {}),
+                "pytest": final_tests.get("pytest", {}),
+            }
+
+        repair_rows = []
+        for item in state.repair_history:
+            repair_rows.append({
+                "attempt": item.get("attempt"),
+                "changed_files": item.get("changed_files", []),
+                "status": item.get("status", "unknown"),
+                "before_quality": item.get("before_quality"),
+                "after_quality": item.get("after_quality"),
+                "rollback_verified": item.get("rollback_verified"),
+            })
+
+        sandbox = state.verification.get("sandbox", {})
+
+        report = {
+            "requirement": requirement[:4000],
+            "changed_files": sorted(set(state.changed_files)),
+            "tests_before_repair": before,
+            "tests_after_repair": after,
+            "verification_history": list(state.verification_history),
+            "repair_attempts": state.repair_attempts,
+            "repair_history": repair_rows,
+            "sandbox_verification": sandbox,
+            "overall_verified": bool(
+                not state.aborted
+                and isinstance(sandbox, dict)
+                and sandbox.get("ok") is True
+                and isinstance(final_tests, dict)
+                and final_tests.get("ok") is True
+            ),
+        }
+
+        state.engineering_report = report
+        state.verification["engineering_report"] = report
+        return report
+
+    @staticmethod
+    def render_engineering_report(report: dict[str, Any]) -> str:
+        """Render the deterministic engineering report as compact Markdown."""
+        changed = report.get("changed_files") or []
+        before = report.get("tests_before_repair") or {}
+        after = report.get("tests_after_repair") or {}
+        sandbox = report.get("sandbox_verification") or {}
+        repairs = report.get("repair_history") or []
+
+        lines = [
+            "## Engineering Verification Report",
+            "",
+            "### Changed files",
+        ]
+        if changed:
+            lines.extend(f"- `{path}`" for path in changed)
+        else:
+            lines.append("- None recorded")
+
+        lines.extend([
+            "",
+            "### Verification before repair",
+            f"- Result: **{'PASSED' if before.get('ok') else 'FAILED' if before else 'Not recorded'}**",
+        ])
+        if before:
+            lines.append(f"- Pytest: {WorkflowEngine._pytest_status(before.get('pytest', {}))}")
+
+        lines.extend([
+            "",
+            "### Verification after repair",
+            f"- Result: **{'PASSED' if after.get('ok') else 'FAILED' if after else 'Not recorded'}**",
+        ])
+        if after:
+            lines.append(f"- Pytest: {WorkflowEngine._pytest_status(after.get('pytest', {}))}")
+
+        lines.extend([
+            "",
+            "### Repair attempts",
+            f"- Total attempts: **{report.get('repair_attempts', 0)}**",
+        ])
+        if repairs:
+            for item in repairs:
+                status = str(item.get("status", "unknown")).replace("_", " ")
+                files = ", ".join(f"`{x}`" for x in item.get("changed_files", [])) or "no files recorded"
+                rollback = item.get("rollback_verified")
+                suffix = " · rollback verified" if rollback is True else ""
+                lines.append(f"- Attempt {item.get('attempt')}: **{status}** · {files}{suffix}")
+        else:
+            lines.append("- No repair was required.")
+
+        lines.extend([
+            "",
+            "### Sandbox verification",
+            f"- Result: **{'PASSED' if sandbox.get('ok') else 'FAILED' if sandbox else 'Not run'}**",
+        ])
+        if sandbox.get("mode"):
+            lines.append(f"- Mode: `{sandbox.get('mode')}`")
+        if sandbox.get("http_status") is not None:
+            lines.append(f"- HTTP status: `{sandbox.get('http_status')}`")
+        if sandbox.get("error"):
+            lines.append(f"- Error: `{str(sandbox.get('error'))[:500]}`")
+
+        lines.extend([
+            "",
+            f"### Overall result",
+            f"**{'VERIFIED' if report.get('overall_verified') else 'NOT VERIFIED'}**",
+        ])
+        return "\n".join(lines)
+
     def verify_project(self, workspace: Path) -> dict[str, Any]:
         """Run the deterministic verification stack once and return both results."""
         compile_result = self.compile_project(workspace)
@@ -833,7 +1018,7 @@ class WorkflowEngine:
     # Workflow stages
     # -------------------------
     def run(self, uploaded_file, requirement: str) -> WorkflowState:
-        state = WorkflowState()
+        state = WorkflowState(requirement=requirement[:5000])
 
         try:
             state.workspace = self.extract(uploaded_file)
@@ -952,6 +1137,10 @@ Rules:
                 self.fail(state, "Implementation produced no valid matching edits.", "implementation")
                 return self._finish(state)
 
+            for path in applied["changed_files"]:
+                if path not in state.changed_files:
+                    state.changed_files.append(path)
+
             self.event(state, "Implementation applied", True, applied)
             self.update(state, "implementation", "done", f"Changed: {', '.join(applied['changed_files'])}")
 
@@ -1022,6 +1211,8 @@ Rules:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(test_code, encoding="utf-8")
                     generated_test_file = requested_test_file
+                    if generated_test_file not in state.changed_files:
+                        state.changed_files.append(generated_test_file)
                     state.verification["test_file"] = generated_test_file
                     self.event(state, "Requirement tests generated", True, {"test_file": generated_test_file})
             else:
@@ -1035,6 +1226,7 @@ Rules:
             # is rolled back before another strategy is attempted.
             verification = self.verify_project(state.workspace)
             state.verification["initial_verification"] = verification
+            self.record_verification(state, "before_repair", verification)
 
             for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
                 compile_result = verification["compile"]
@@ -1059,6 +1251,7 @@ Rules:
                 )
 
                 if testing_ok:
+                    state.verification["final_tests"] = verification
                     self.update(state, "testing", "done", "Compile and tests passed")
                     self.update(state, "failure_analysis", "skipped", "No test failures")
                     if state.repair_attempts:
@@ -1171,6 +1364,8 @@ Rules:
                     f"Repair attempt {attempt + 1} of {MAX_REPAIR_ATTEMPTS}",
                 )
 
+                changed_files_before_attempt = set(state.changed_files)
+
                 current_code = []
                 for path in focused:
                     try:
@@ -1217,6 +1412,10 @@ Rules:
                     self.fail(state, "Repair stage produced no valid matching edits.", "repair")
                     return self._finish(state)
 
+                for path in repair_result["changed_files"]:
+                    if path not in state.changed_files:
+                        state.changed_files.append(path)
+
                 state.verification["repair_candidate"] = {
                     "attempt": state.repair_attempts,
                     "changed_files": repair_result["changed_files"],
@@ -1235,6 +1434,11 @@ Rules:
                 # Immediate retest closes the agentic loop and gives the next
                 # diagnosis concrete evidence from the exact repair just made.
                 post_repair = self.verify_project(state.workspace)
+                self.record_verification(
+                    state,
+                    f"after_repair_{state.repair_attempts}",
+                    post_repair,
+                )
                 self.event(
                     state,
                     f"Retest after repair {state.repair_attempts}",
@@ -1283,6 +1487,11 @@ Rules:
                     )
 
                     restored_verification = self.verify_project(state.workspace)
+                    self.record_verification(
+                        state,
+                        f"after_rollback_{state.repair_attempts}",
+                        restored_verification,
+                    )
                     rollback_ok = rollback["ok"] and (
                         restored_verification["quality"] == before_quality
                     )
@@ -1315,6 +1524,7 @@ Rules:
                         )
                         return self._finish(state)
 
+                    state.changed_files = sorted(changed_files_before_attempt)
                     verification = restored_verification
                 else:
                     state.repair_history.append({
@@ -1358,13 +1568,17 @@ Rules:
             self.event(state, "Sandbox verification", smoke.get("ok", False), smoke)
 
             if not smoke.get("ok", False):
+                self.build_engineering_report(state, requirement)
                 self.fail(state, f"Sandbox verification failed: {smoke.get('error', 'unknown error')}", "sandbox")
                 return self._finish(state)
 
             self.update(state, "sandbox", "done", "Application responded successfully")
 
             # 10. Final report
-            self.update(state, "final_report", "active", "Preparing verified report")
+            engineering_report = self.build_engineering_report(state, requirement)
+            engineering_markdown = self.render_engineering_report(engineering_report)
+
+            self.update(state, "final_report", "active", "Preparing verified engineering report")
             final = self.llm_json(
                 """
 You are the final-report specialist.
@@ -1374,20 +1588,22 @@ Return JSON only:
   "verified": true or false
 }
 Never claim verification that is not present in the supplied results.
-Mention changed files, tests and sandbox status.
+Mention changed files, tests before/after repair, every repair attempt, rollback events if any, and sandbox status.
+The deterministic engineering report supplied in the input is the source of truth.
 """,
                 json.dumps({
                     "requirement": requirement[:4000],
+                    "engineering_report": engineering_report,
                     "verification": state.verification,
-                    "repair_history": state.repair_history,
                     "events": state.events[-12:],
                 })[:MAX_CONTEXT_CHARS],
                 state,
             )
 
             if final.get("verified") is True:
-                state.final_report = str(final.get("report", "Development run verified."))
-                self.update(state, "final_report", "done", "Verified final report generated")
+                narrative = str(final.get("report", "Development run verified."))
+                state.final_report = narrative.rstrip() + "\n\n" + engineering_markdown
+                self.update(state, "final_report", "done", "Verified engineering report generated")
             else:
                 self.fail(state, "Final report could not establish verified completion.", "final_report")
 
@@ -1405,6 +1621,15 @@ Mention changed files, tests and sandbox status.
         return "final_report"
 
     def _finish(self, state: WorkflowState) -> WorkflowState:
+        # Feature 3: always preserve a factual engineering report, even when the
+        # workflow stops early. The report is derived from observed state and never
+        # asks the model to invent execution facts.
+        report = state.engineering_report
+        if not report:
+            report = self.build_engineering_report(state, state.requirement)
+
+        engineering_markdown = self.render_engineering_report(report)
+
         if state.aborted:
             if not state.final_report:
                 state.final_report = (
@@ -1414,6 +1639,9 @@ Mention changed files, tests and sandbox status.
                 )
         elif not state.final_report:
             state.final_report = "## Result\n\nDevelopment run completed."
+
+        if "## Engineering Verification Report" not in state.final_report:
+            state.final_report = state.final_report.rstrip() + "\n\n" + engineering_markdown
 
         if self.callback:
             self.callback(state)
