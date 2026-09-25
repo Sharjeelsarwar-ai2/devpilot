@@ -27,7 +27,7 @@ MAX_STAGE_CALLS = 1
 MAX_REPAIR_ATTEMPTS = 2
 MAX_RATE_LIMIT_RETRIES = 2
 MAX_JSON_RETRIES = 2
-MAX_OUTPUT_TOKENS = 1800
+MAX_OUTPUT_TOKENS = 2400
 
 STAGES = [
     ("requirements", "Requirements", "Turn the user request into explicit acceptance criteria."),
@@ -258,10 +258,16 @@ class WorkflowEngine:
                         ],
                         temperature=0,
                         max_tokens=MAX_OUTPUT_TOKENS,
-                        response_format={"type": "json_object"},
                     )
 
-                    text = response.choices[0].message.content or "{}"
+                    # Do NOT use Groq response_format=json_object here.
+                    # Some Groq model/provider combinations can reject the request
+                    # before generation with `json_validate_failed`, even when the
+                    # prompt explicitly requests JSON. We enforce JSON in the prompt
+                    # and parse/validate it locally instead.
+                    text = response.choices[0].message.content or ""
+                    if not text.strip():
+                        raise ValueError("LLM returned an empty response.")
                     return self._parse_json_object(text)
 
                 except RateLimitError as exc:
