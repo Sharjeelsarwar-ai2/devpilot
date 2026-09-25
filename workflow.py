@@ -56,6 +56,7 @@ class WorkflowState:
     )
     events: list[dict[str, Any]] = field(default_factory=list)
     repair_attempts: int = 0
+    repair_history: list[dict[str, Any]] = field(default_factory=list)
     aborted: bool = False
     abort_reason: str = ""
     final_report: str = ""
@@ -478,7 +479,111 @@ class WorkflowEngine:
             "ok": True,
             "changed_files": changed,
             "count": len(changed),
+            "rollback_state": [
+                {
+                    "path": target.relative_to(workspace).as_posix(),
+                    "original": original,
+                }
+                for target, original in originals.items()
+            ],
         }
+
+    def rollback_changes(
+        self,
+        workspace: Path,
+        rollback_state: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Restore exactly the files changed by one repair attempt."""
+        restored = []
+        errors = []
+
+        for item in rollback_state:
+            if not isinstance(item, dict):
+                continue
+
+            path = item.get("path")
+            original = item.get("original")
+            if not isinstance(path, str):
+                continue
+
+            try:
+                target = self.safe_path(workspace, path)
+                if original is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(original), encoding="utf-8")
+                restored.append(path)
+            except Exception as exc:
+                errors.append({"path": path, "error": str(exc)})
+
+        return {
+            "ok": not errors,
+            "restored_files": restored,
+            "errors": errors,
+        }
+
+    @staticmethod
+    def verification_quality(
+        compile_result: dict[str, Any],
+        pytest_result: dict[str, Any],
+    ) -> tuple[int, int, int, int]:
+        """Return a conservative quality tuple for comparing repair attempts."""
+        compile_ok = 1 if compile_result.get("ok") else 0
+        pytest_ok = 1 if pytest_result.get("ok") else 0
+
+        output = "\n".join(
+            [
+                str(pytest_result.get("stdout", "") or ""),
+                str(pytest_result.get("stderr", "") or ""),
+            ]
+        )
+
+        def count(pattern: str) -> int:
+            matches = re.findall(pattern, output, flags=re.I)
+            return int(matches[-1]) if matches else 0
+
+        passed = count(r"(\d+)\s+passed")
+        failed = count(r"(\d+)\s+failed")
+        errors = count(r"(\d+)\s+errors?")
+
+        # Tuple ordering prefers successful compile/tests, then more passing
+        # tests, then fewer failures/errors. It is deliberately modest: a
+        # repair is not considered successful until pytest itself passes.
+        return (compile_ok, pytest_ok, passed, -(failed + errors))
+
+    @staticmethod
+    def failed_test_output(pytest_result: dict[str, Any], limit: int = 7000) -> str:
+        """Extract the most useful pytest output for the next diagnosis/repair."""
+        text = "\n".join(
+            [
+                str(pytest_result.get("stdout", "") or ""),
+                str(pytest_result.get("stderr", "") or ""),
+            ]
+        ).strip()
+        return text[-limit:]
+
+    @staticmethod
+    def likely_failure_files(pytest_result: dict[str, Any], candidates: list[str]) -> list[str]:
+        """Return candidate files explicitly mentioned by pytest output."""
+        output = WorkflowEngine.failed_test_output(pytest_result, limit=9000)
+        explicit = []
+        for path in candidates:
+            if path and path in output and path not in explicit:
+                explicit.append(path)
+        return explicit[:8]
+
+    def verify_project(self, workspace: Path) -> dict[str, Any]:
+        """Run the deterministic verification stack once and return both results."""
+        compile_result = self.compile_project(workspace)
+        pytest_result = self.run_pytest(workspace)
+        return {
+            "compile": compile_result,
+            "pytest": pytest_result,
+            "ok": compile_result["ok"] and pytest_result["ok"],
+            "quality": self.verification_quality(compile_result, pytest_result),
+        }
+
     # -------------------------
     # Deterministic verification
     # -------------------------
@@ -924,45 +1029,93 @@ Rules:
 
             self.update(state, "test_generation", "done", "Focused tests prepared")
 
-            # 6-8 Verification / failure analysis / repair loop
-            for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
-                self.update(state, "testing", "active", "Running compile and tests")
-                compile_result = self.compile_project(state.workspace)
-                pytest_result = self.run_pytest(state.workspace)
-                testing_ok = compile_result["ok"] and pytest_result["ok"]
+            # 6-8 Verification / failure analysis / autonomous repair loop
+            # The loop is intentionally closed: test -> diagnose -> patch -> retest.
+            # Each repair is reversible, and a repair that makes verification worse
+            # is rolled back before another strategy is attempted.
+            verification = self.verify_project(state.workspace)
+            state.verification["initial_verification"] = verification
 
+            for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
+                compile_result = verification["compile"]
+                pytest_result = verification["pytest"]
+                testing_ok = verification["ok"]
+
+                self.update(
+                    state,
+                    "testing",
+                    "active",
+                    f"Verification cycle {attempt + 1}"
+                )
                 self.event(
                     state,
-                    f"Testing attempt {attempt + 1}",
+                    f"Testing cycle {attempt + 1}",
                     testing_ok,
-                    {"compile": compile_result, "pytest": pytest_result},
+                    {
+                        "compile": compile_result,
+                        "pytest": pytest_result,
+                        "quality": verification["quality"],
+                    },
                 )
 
                 if testing_ok:
                     self.update(state, "testing", "done", "Compile and tests passed")
                     self.update(state, "failure_analysis", "skipped", "No test failures")
-                    self.update(state, "repair", "skipped", "No repair required")
+                    if state.repair_attempts:
+                        self.update(
+                            state,
+                            "repair",
+                            "done",
+                            f"Closed-loop repair succeeded after {state.repair_attempts} attempt(s)",
+                        )
+                    else:
+                        self.update(state, "repair", "skipped", "No repair required")
                     break
 
-                self.update(state, "testing", "error", "Verification tests failed")
-                self.update(state, "failure_analysis", "active", "Classifying test failure")
+                state.verification["latest_failure"] = {
+                    "compile": compile_result,
+                    "pytest": pytest_result,
+                    "quality": verification["quality"],
+                }
 
-                failure_payload = {"compile": compile_result, "pytest": pytest_result}
+                self.update(state, "testing", "error", "Verification tests failed")
+
+                # No third diagnosis is needed when the bounded repair budget is
+                # exhausted. This keeps the loop deterministic and avoids spending
+                # another model call when there is no repair slot left.
+                if attempt >= MAX_REPAIR_ATTEMPTS:
+                    self.fail(state, "Maximum repair attempts reached.", "repair")
+                    return self._finish(state)
+
+                self.update(state, "failure_analysis", "active", "Diagnosing the observed failure")
+
+                failure_text = self.failed_test_output(pytest_result)
+                failure_payload = {
+                    "compile": compile_result,
+                    "pytest": pytest_result,
+                    "failure_output": failure_text,
+                    "repair_history": state.repair_history[-3:],
+                }
                 analysis = self.llm_json(
                     """
-You are the failure-analysis specialist.
-Classify the failure without editing code.
+You are the failure-analysis specialist inside a closed-loop software repair agent.
+Classify the CURRENT verification failure and determine whether a focused repair is safe.
 Return JSON only:
 {
   "type": "project" or "infrastructure",
-  "cause": "brief cause",
-  "repair_needed": true or false
+  "cause": "brief concrete cause based on the observed output",
+  "repair_needed": true or false,
+  "target_files": ["file.py"],
+  "strategy": "brief repair strategy"
 }
 Rules:
-- Read the pytest failure output carefully, including the exact expected and actual values.
-- If an existing test asserts an exact old return shape and the requested requirement intentionally adds a new field or changes that contract, classify it as a project/test-contract failure and set repair_needed=true.
+- Read the exact pytest/compile output, including expected vs actual values.
+- If an existing test asserts an exact old return shape and the requested requirement intentionally adds a field or changes that contract, classify it as a project/test-contract failure and set repair_needed=true.
 - Do NOT call an intentional requirement change an infrastructure failure.
-- Prefer repairing the affected test expectation when the implementation matches the requirement.
+- Mark infrastructure only for environment/tooling failures (missing runtime, dependency installation failure, OS/process failure, etc.).
+- target_files must contain only files that are clearly implicated by the failure output or provided project context.
+- Never invent a failure cause that is not supported by the supplied evidence.
+- Use repair_needed=false when the evidence does not support a safe focused code/test repair.
 """,
                     json.dumps(failure_payload)[:MAX_CONTEXT_CHARS],
                     state,
@@ -971,27 +1124,65 @@ Rules:
                 self.event(state, "Failure analyzed", True, analysis)
 
                 if analysis.get("type") == "infrastructure":
-                    self.fail(state, str(analysis.get("cause", "Verification environment failure")), "failure_analysis")
+                    self.fail(
+                        state,
+                        str(analysis.get("cause", "Verification environment failure")),
+                        "failure_analysis",
+                    )
                     return self._finish(state)
 
-                self.update(state, "failure_analysis", "done", str(analysis.get("cause", "Project failure"))[:120])
-
-                if attempt >= MAX_REPAIR_ATTEMPTS:
-                    self.fail(state, "Maximum repair attempts reached.", "repair")
+                if analysis.get("repair_needed") is not True:
+                    self.fail(
+                        state,
+                        str(analysis.get("cause", "Failure could not be safely repaired.")),
+                        "failure_analysis",
+                    )
                     return self._finish(state)
 
-                self.update(state, "repair", "active", f"Repair attempt {attempt + 1} of {MAX_REPAIR_ATTEMPTS}")
+                self.update(
+                    state,
+                    "failure_analysis",
+                    "done",
+                    str(analysis.get("cause", "Project failure"))[:120],
+                )
+
+                # Narrow the next repair's context to implicated files when possible.
+                target_files = analysis.get("target_files", [])
+                if not isinstance(target_files, list):
+                    target_files = []
+                target_files = [str(x) for x in target_files if isinstance(x, str)]
+                target_files = [
+                    path for path in target_files
+                    if path in relevant
+                    or path.startswith("tests/")
+                    or path.endswith((".py", ".js", ".ts", ".cs"))
+                ]
+                hinted_files = self.likely_failure_files(pytest_result, relevant)
+                focused = []
+                for path in target_files + hinted_files + relevant:
+                    if path not in focused:
+                        focused.append(path)
+                focused = focused[:8]
+
+                self.update(
+                    state,
+                    "repair",
+                    "active",
+                    f"Repair attempt {attempt + 1} of {MAX_REPAIR_ATTEMPTS}",
+                )
 
                 current_code = []
-                for path in relevant[:8]:
+                for path in focused:
                     try:
-                        current_code.append(f"FILE: {path}\n{self.read_text(state.workspace, path)[:7000]}")
+                        current_code.append(
+                            f"FILE: {path}\n{self.read_text(state.workspace, path)[:7000]}"
+                        )
                     except Exception:
                         pass
 
                 repair = self.llm_json(
                     """
-You are the repair specialist for a software development agent.
+You are the repair specialist for a closed-loop software development agent.
 Return focused edits only:
 {
   "edits": [
@@ -1002,33 +1193,152 @@ Return focused edits only:
 Rules:
 - Maximum 3 edits.
 - Use exact current text from the supplied code.
+- Work only on the implicated failure and requested requirement.
 - Do not rewrite whole files.
 - Do not modify secret files.
 - Do not create dependency-shadowing files.
-- Read the pytest output before deciding what to change.
-- Preserve all behavior that is outside the requested requirement.
-- If the implementation intentionally adds a field to a returned dictionary and an existing test uses an exact dictionary equality assertion for the old contract, update that test to assert the new required field and keep the existing assertions intact.
-- Do NOT remove the newly required field merely to make an old test pass.
-- If the requirement says to update tests, update/add the focused test rather than weakening the implementation.
-- Never replace a test with a trivial assertion such as `assert True`.
+- Read the latest pytest/compile evidence before deciding what to change.
+- Preserve behavior outside the requirement.
+- If the implementation intentionally adds a field to a returned dictionary and an existing test uses exact dictionary equality for the old contract, update that test to assert the new required field and keep the existing assertions intact.
+- Do NOT remove a newly required field merely to make an old test pass.
+- Never weaken tests with `assert True`, unconditional skips, or by deleting the failing assertion.
 - Keep completed/open behavior and unrelated tests unchanged.
+- Prefer the smallest patch that addresses the diagnosed cause.
 """,
-                    f"Failure:\n{json.dumps(failure_payload)[:8000]}\n\nCurrent code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
+                    f"Failure analysis:\n{json.dumps(analysis)[:7000]}\n\nLatest failure evidence:\n{failure_text[:7000]}\n\nCurrent focused code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
                     state,
                 )
 
-                repair_result = self.apply_edits(
-                    state.workspace,
-                    self.normalize_edits(repair),
-                )
+                repair_edits = self.normalize_edits(repair)
+                repair_result = self.apply_edits(state.workspace, repair_edits)
                 state.repair_attempts += 1
 
                 if not repair_result["changed_files"]:
-                    self.fail(state, "Repair stage produced no valid edits.", "repair")
+                    self.fail(state, "Repair stage produced no valid matching edits.", "repair")
                     return self._finish(state)
 
-                self.event(state, f"Repair attempt {attempt + 1}", True, repair_result)
-                self.update(state, "repair", "done", f"Changed: {', '.join(repair_result['changed_files'])}")
+                state.verification["repair_candidate"] = {
+                    "attempt": state.repair_attempts,
+                    "changed_files": repair_result["changed_files"],
+                    "notes": str(repair.get("notes", ""))[:1000],
+                }
+                self.event(
+                    state,
+                    f"Repair attempt {state.repair_attempts} applied",
+                    True,
+                    {
+                        "changed_files": repair_result["changed_files"],
+                        "count": repair_result["count"],
+                    },
+                )
+
+                # Immediate retest closes the agentic loop and gives the next
+                # diagnosis concrete evidence from the exact repair just made.
+                post_repair = self.verify_project(state.workspace)
+                self.event(
+                    state,
+                    f"Retest after repair {state.repair_attempts}",
+                    post_repair["ok"],
+                    {
+                        "compile": post_repair["compile"],
+                        "pytest": post_repair["pytest"],
+                        "quality": post_repair["quality"],
+                    },
+                )
+
+                before_quality = verification["quality"]
+                after_quality = post_repair["quality"]
+
+                if post_repair["ok"]:
+                    state.repair_history.append({
+                        "attempt": state.repair_attempts,
+                        "changed_files": repair_result["changed_files"],
+                        "status": "verified",
+                        "before_quality": before_quality,
+                        "after_quality": after_quality,
+                    })
+                    state.verification["final_tests"] = post_repair
+                    self.update(
+                        state,
+                        "repair",
+                        "done",
+                        f"Repair {state.repair_attempts} passed immediate retest",
+                    )
+                    verification = post_repair
+                    continue
+
+                # Never silently keep a repair that made deterministic verification
+                # worse. Restore exactly what that repair changed and confirm the
+                # rollback itself is healthy before another attempt.
+                if after_quality < before_quality:
+                    rollback = self.rollback_changes(
+                        state.workspace,
+                        repair_result.get("rollback_state", []),
+                    )
+                    self.event(
+                        state,
+                        f"Repair {state.repair_attempts} rolled back",
+                        rollback["ok"],
+                        rollback,
+                    )
+
+                    restored_verification = self.verify_project(state.workspace)
+                    rollback_ok = rollback["ok"] and (
+                        restored_verification["quality"] == before_quality
+                    )
+                    self.event(
+                        state,
+                        "Rollback verification",
+                        rollback_ok,
+                        {
+                            "quality": restored_verification["quality"],
+                            "expected_quality": before_quality,
+                            "compile": restored_verification["compile"],
+                            "pytest": restored_verification["pytest"],
+                        },
+                    )
+
+                    state.repair_history.append({
+                        "attempt": state.repair_attempts,
+                        "changed_files": repair_result["changed_files"],
+                        "status": "rolled_back",
+                        "before_quality": before_quality,
+                        "after_quality": after_quality,
+                        "rollback_verified": rollback_ok,
+                    })
+
+                    if not rollback_ok:
+                        self.fail(
+                            state,
+                            "A repair worsened verification and safe rollback could not be confirmed.",
+                            "repair",
+                        )
+                        return self._finish(state)
+
+                    verification = restored_verification
+                else:
+                    state.repair_history.append({
+                        "attempt": state.repair_attempts,
+                        "changed_files": repair_result["changed_files"],
+                        "status": "failed_retest",
+                        "before_quality": before_quality,
+                        "after_quality": after_quality,
+                    })
+                    verification = post_repair
+
+                self.update(
+                    state,
+                    "repair",
+                    "done",
+                    f"Repair {state.repair_attempts} did not verify; continuing diagnosis",
+                )
+
+                # Continue to the next loop iteration with the exact post-repair
+                # (or post-rollback) verification evidence.
+                state.verification["repair_history"] = state.repair_history[-5:]
+            else:
+                self.fail(state, "Verification loop ended without a terminal result.", "testing")
+                return self._finish(state)
 
             # 9. Sandbox verification
             self.update(state, "sandbox", "active", "Running Streamlit smoke verification")
@@ -1069,7 +1379,8 @@ Mention changed files, tests and sandbox status.
                 json.dumps({
                     "requirement": requirement[:4000],
                     "verification": state.verification,
-                    "events": state.events[-8:],
+                    "repair_history": state.repair_history,
+                    "events": state.events[-12:],
                 })[:MAX_CONTEXT_CHARS],
                 state,
             )
