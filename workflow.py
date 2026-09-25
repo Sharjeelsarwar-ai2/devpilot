@@ -591,9 +591,32 @@ class WorkflowEngine:
         proc = None
 
         try:
+            # Use the exact Python interpreter running DevPilot. Calling the
+            # generic `python` command can resolve to a different environment
+            # that does not contain Streamlit, causing the child process to
+            # exit immediately with a misleading sandbox failure.
+            python_executable = sys.executable or "python"
+
+            streamlit_check = subprocess.run(
+                [python_executable, "-c", "import streamlit"],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env={**os.environ, "PYTHONUNBUFFERED": "1", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+            )
+
+            if streamlit_check.returncode != 0:
+                return {
+                    "ok": False,
+                    "error_type": "infrastructure",
+                    "error": "Streamlit is not available in the DevPilot Python environment.",
+                    "startup_log": (streamlit_check.stderr or streamlit_check.stdout or "")[-6000:],
+                }
+
             proc = subprocess.Popen(
                 [
-                    "python",
+                    python_executable,
                     "-m",
                     "streamlit",
                     "run",
