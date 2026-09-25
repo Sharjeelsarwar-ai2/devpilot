@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from groq import Groq, RateLimitError
+from ui_tester import run_browser_ui_tests, validate_ui_test_plan
 
 
 DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -41,6 +43,7 @@ STAGES = [
     ("failure_analysis", "Failure analysis", "Classify real project failures."),
     ("repair", "Repair", "Fix project failures with bounded edits."),
     ("sandbox", "Sandbox verification", "Verify the application in a controlled subprocess."),
+    ("ui_testing", "Browser/UI testing", "Exercise user-visible application behavior in a controlled browser."),
     ("final_report", "Final report", "Summarize only what was actually verified."),
 ]
 
@@ -578,6 +581,167 @@ class WorkflowEngine:
         return explicit[:8]
 
     @staticmethod
+    def deterministic_contract_test_repair(
+        workspace: Path,
+        failure_text: str,
+        requirement: str,
+    ) -> dict[str, Any] | None:
+        """Safely repair stale exact-dict test expectations caused by additive fields.
+
+        This is intentionally narrow and deterministic. It only fires when pytest
+        proves that the implementation returned a dictionary with one or more new
+        keys while the test expected the same dictionary without those keys. The
+        added keys (and string values when present) must also be explicitly supported
+        by the user's requirement. Existing expected keys/values are never changed.
+        """
+        if not failure_text or not requirement:
+            return None
+
+        requirement_lower = requirement.lower()
+
+        # Example pytest location: tests/test_tasks.py:7: AssertionError
+        location_matches = re.findall(
+            r"(?m)^\s*([^\s:]+\.py):(\d+):\s*AssertionError\s*$",
+            failure_text,
+        )
+        if not location_matches:
+            return None
+
+        # Example: At index 0 diff: {'title': '...', 'priority': 'Medium'} != {...}
+        diff_match = re.search(
+            r"At index\s+(\d+)\s+diff:\s*(.+?)\s+!=\s*(.+?)\s*$",
+            failure_text,
+            flags=re.MULTILINE,
+        )
+        if not diff_match:
+            return None
+
+        try:
+            item_index = int(diff_match.group(1))
+            actual_item = ast.literal_eval(diff_match.group(2).strip())
+            expected_item_from_diff = ast.literal_eval(diff_match.group(3).strip())
+        except (ValueError, SyntaxError):
+            return None
+
+        if not isinstance(actual_item, dict) or not isinstance(expected_item_from_diff, dict):
+            return None
+
+        # Only additive dictionary changes are eligible. No existing value may differ.
+        extra_keys = [key for key in actual_item if key not in expected_item_from_diff]
+        if not extra_keys:
+            return None
+        if set(expected_item_from_diff) - set(actual_item):
+            return None
+        for key in expected_item_from_diff:
+            if actual_item.get(key) != expected_item_from_diff.get(key):
+                return None
+
+        # Requirement-gated: do not rewrite an old test merely because the output
+        # happens to contain an extra field. The requested feature must name the
+        # new field, and string values such as "Medium" must also be supported.
+        for key in extra_keys:
+            if str(key).lower() not in requirement_lower:
+                return None
+            value = actual_item[key]
+            if isinstance(value, str) and value.lower() not in requirement_lower:
+                return None
+
+        # Read the implicated test file and find the assertion at/near the pytest
+        # line. Resolve it through the workspace-safe path helper semantics by
+        # rejecting absolute and escaping paths.
+        test_rel, line_text = location_matches[0]
+        try:
+            test_path = (workspace / Path(test_rel)).resolve()
+            workspace_resolved = workspace.resolve()
+            test_path.relative_to(workspace_resolved)
+            source = test_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+
+        try:
+            tree = ast.parse(source)
+            target_line = int(line_text)
+        except (SyntaxError, ValueError):
+            return None
+
+        target_assert = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assert):
+                continue
+            end_line = getattr(node, "end_lineno", node.lineno)
+            if node.lineno <= target_line <= end_line:
+                target_assert = node
+                break
+        if target_assert is None or not isinstance(target_assert.test, ast.Compare):
+            return None
+
+        compare = target_assert.test
+        if len(compare.ops) != 1 or not isinstance(compare.ops[0], ast.Eq) or len(compare.comparators) != 1:
+            return None
+
+        # Prefer the literal side of the equality as the expected value.
+        literal_node = None
+        for candidate in (compare.comparators[0], compare.left):
+            if isinstance(candidate, (ast.List, ast.Tuple, ast.Dict)):
+                literal_node = candidate
+                break
+        if literal_node is None:
+            return None
+
+        try:
+            expected_literal = ast.literal_eval(literal_node)
+        except (ValueError, SyntaxError):
+            return None
+
+        updated_literal = None
+        if (
+            isinstance(expected_literal, list)
+            and 0 <= item_index < len(expected_literal)
+            and isinstance(expected_literal[item_index], dict)
+        ):
+            # Ensure the source expectation exactly matches the diff's expected item
+            # before adding only the proven missing keys.
+            source_expected_item = expected_literal[item_index]
+            if source_expected_item != expected_item_from_diff:
+                return None
+            updated = list(expected_literal)
+            updated_item = dict(source_expected_item)
+            for key in extra_keys:
+                updated_item[key] = actual_item[key]
+            updated[item_index] = updated_item
+            updated_literal = updated
+        elif isinstance(expected_literal, dict) and item_index == 0:
+            if expected_literal != expected_item_from_diff:
+                return None
+            updated_literal = dict(expected_literal)
+            for key in extra_keys:
+                updated_literal[key] = actual_item[key]
+
+        if updated_literal is None:
+            return None
+
+        search = ast.get_source_segment(source, literal_node)
+        if not search:
+            return None
+        replacement = repr(updated_literal)
+        if replacement == search or any(str(key) not in replacement for key in extra_keys):
+            return None
+
+        relative = test_path.relative_to(workspace_resolved).as_posix()
+        return {
+            "edits": [{
+                "path": relative,
+                "search": search,
+                "replace": replacement,
+            }],
+            "notes": (
+                "Deterministically updated a stale exact dictionary test expectation "
+                "to include the requirement-backed additive return field(s): "
+                + ", ".join(map(str, extra_keys))
+            ),
+        }
+
+    @staticmethod
     def _pytest_status(pytest_result: dict[str, Any]) -> str:
         """Create a compact factual pytest status for the engineering report."""
         if not isinstance(pytest_result, dict):
@@ -621,6 +785,9 @@ class WorkflowEngine:
             "quality": list(verification.get("quality", ())),
             "compile": verification.get("compile", {}),
             "pytest": verification.get("pytest", {}),
+            "sandbox": verification.get("sandbox", {}),
+            "ui": verification.get("ui", {}),
+            "ui_required": bool(verification.get("ui_required")),
         })
 
     def build_engineering_report(self, state: WorkflowState, requirement: str) -> dict[str, Any]:
@@ -676,12 +843,22 @@ class WorkflowEngine:
             "repair_attempts": state.repair_attempts,
             "repair_history": repair_rows,
             "sandbox_verification": sandbox,
+            "browser_ui_verification": (
+                final_tests.get("ui", {}) if isinstance(final_tests, dict) else {}
+            ),
+            "ui_testing_required": bool(
+                final_tests.get("ui_required") if isinstance(final_tests, dict) else state.verification.get("ui_test_plan", {}).get("enabled")
+            ),
             "overall_verified": bool(
                 not state.aborted
                 and isinstance(sandbox, dict)
                 and sandbox.get("ok") is True
                 and isinstance(final_tests, dict)
                 and final_tests.get("ok") is True
+                and (
+                    not final_tests.get("ui_required")
+                    or final_tests.get("ui", {}).get("ok") is True
+                )
             ),
         }
 
@@ -696,6 +873,8 @@ class WorkflowEngine:
         before = report.get("tests_before_repair") or {}
         after = report.get("tests_after_repair") or {}
         sandbox = report.get("sandbox_verification") or {}
+        ui = report.get("browser_ui_verification") or {}
+        ui_required = bool(report.get("ui_testing_required"))
         repairs = report.get("repair_history") or []
 
         lines = [
@@ -753,10 +932,504 @@ class WorkflowEngine:
 
         lines.extend([
             "",
+            "### Browser/UI verification",
+        ])
+        if not ui_required:
+            lines.append("- Not required / no safe UI test plan generated.")
+        else:
+            lines.append(f"- Result: **{'PASSED' if ui.get('ok') else 'FAILED' if ui else 'Not run'}**")
+            if ui.get("tests_run") is not None:
+                lines.append(
+                    f"- Tests: `{ui.get('tests_passed', 0)}/{ui.get('tests_run', 0)} passed`"
+                )
+            if ui.get("error"):
+                lines.append(f"- Error: `{str(ui.get('error'))[:600]}`")
+            screenshots = [
+                item.get("screenshot")
+                for item in ui.get("results", [])
+                if item.get("screenshot")
+            ]
+            if screenshots:
+                lines.append(f"- Failure screenshots: `{len(screenshots)}` artifact(s) captured")
+
+        lines.extend([
+            "",
             f"### Overall result",
             f"**{'VERIFIED' if report.get('overall_verified') else 'NOT VERIFIED'}**",
         ])
         return "\n".join(lines)
+
+    def generate_ui_test_plan(
+        self,
+        state: WorkflowState,
+        requirement: str,
+        inspection: dict[str, Any],
+        current_snippets: list[str],
+    ) -> dict[str, Any]:
+        """Generate a small, requirement-focused browser test plan for Streamlit apps.
+
+        This is additive verification. Failure to create a safe UI plan never stops
+        the core development workflow; the plan is marked unavailable and the normal
+        deterministic verification continues.
+        """
+        entry = inspection.get("entry_point")
+        if not isinstance(entry, str) or not entry.endswith(".py"):
+            return {
+                "enabled": False,
+                "reason": "No Python application entry point available for Streamlit UI testing.",
+                "tests": [],
+            }
+
+        try:
+            entry_source = self.read_text(state.workspace, entry)[:12000]
+        except Exception:
+            return {
+                "enabled": False,
+                "reason": "Could not read the detected application entry point for UI test planning.",
+                "tests": [],
+            }
+
+        if "streamlit" not in entry_source.lower():
+            return {
+                "enabled": False,
+                "reason": "Detected entry point is not a Streamlit application.",
+                "tests": [],
+            }
+
+        system = """
+You are the browser UI test-planning specialist inside a software engineering agent.
+Create a small deterministic Playwright test plan for the supplied Streamlit application.
+Return JSON only:
+{
+  "tests": [
+    {
+      "name": "clear test name",
+      "steps": [
+        {"action": "open", "path": "/"},
+        {"action": "fill", "target": "visible field label", "value": "safe test value"},
+        {"action": "select", "target": "visible select label", "value": "safe option"},
+        {"action": "click", "target": "visible button text"},
+        {"action": "assert_text", "target": "expected visible text"}
+      ]
+    }
+  ],
+  "message": "brief"
+}
+Rules:
+- Generate at most 5 tests and at most 20 steps per test.
+- Only test behavior that is relevant to the user's requirement.
+- Use visible labels, visible button/link text, or expected visible text. Do not invent CSS/XPath selectors.
+- Allowed actions only: open, click, fill, select, press, assert_text, assert_visible, assert_url.
+- open paths must stay relative, such as "/" or "/page".
+- Use small non-destructive test values. Do not test payments, external accounts, emails, or destructive actions.
+- Do not navigate outside localhost.
+- Do not use arbitrary JavaScript.
+- Prefer one end-to-end happy path plus one preservation/regression behavior when the requirement calls for it.
+- If there is not enough evidence in the supplied code to create a safe useful UI test, return an empty tests list and explain why.
+"""
+        user = (
+            f"Requirement:\n{requirement[:5000]}\n\n"
+            f"Inspection:\n{json.dumps(inspection)[:7000]}\n\n"
+            f"Entry point: {entry}\n\n"
+            f"Entry source:\n{entry_source}\n\n"
+            f"Relevant code:\n{chr(10).join(current_snippets)[:MAX_CONTEXT_CHARS]}"
+        )
+
+        try:
+            plan = self.llm_json(system, user, state)
+            validation = validate_ui_test_plan(plan)
+            if not validation.get("ok"):
+                return {
+                    "enabled": False,
+                    "reason": f"UI test plan was rejected by safety validation: {validation.get('error', 'invalid plan')}",
+                    "tests": [],
+                }
+            tests = validation.get("tests", [])
+            return {
+                "enabled": bool(tests),
+                "reason": validation.get("message", ""),
+                "tests": tests,
+                "entry_point": entry,
+                "plan_generated": True,
+            }
+        except Exception as exc:
+            return {
+                "enabled": False,
+                "reason": f"UI test planning unavailable: {str(exc)[:700]}",
+                "tests": [],
+                "entry_point": entry,
+                "plan_generated": False,
+            }
+
+    @staticmethod
+    def full_verification_quality(verification: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+        """Compare complete verification states, including runtime and UI checks."""
+        base = WorkflowEngine.verification_quality(
+            verification.get("compile", {}),
+            verification.get("pytest", {}),
+        )
+
+        sandbox = verification.get("sandbox", {})
+        ui = verification.get("ui", {})
+
+        sandbox_ok = 1 if sandbox.get("ok") is True or sandbox.get("mode") == "not_applicable" else 0
+        ui_required = bool(verification.get("ui_required"))
+        ui_ok = 1 if (not ui_required or ui.get("ok") is True) else 0
+
+        return (base[0], base[1], sandbox_ok, ui_ok, base[2], base[3])
+
+    def verify_all(
+        self,
+        workspace: Path,
+        entry: str | None,
+        ui_plan: dict[str, Any],
+        artifacts_dir: Path,
+    ) -> dict[str, Any]:
+        """Run deterministic checks, application startup, and optional browser tests."""
+        deterministic = self.verify_project(workspace)
+        result = {
+            **deterministic,
+            "sandbox": {},
+            "ui": {},
+            "ui_required": bool(ui_plan.get("enabled")),
+        }
+
+        if not deterministic["ok"]:
+            result["sandbox"] = {
+                "ok": False,
+                "mode": "not_run",
+                "message": "Sandbox and browser tests were deferred until compile/tests pass.",
+            }
+            result["ui"] = {
+                "ok": False,
+                "mode": "not_run",
+                "message": "Browser tests were deferred until compile/tests pass.",
+            }
+            result["quality"] = self.full_verification_quality(result)
+            return result
+
+        runtime = self.run_streamlit_runtime_checks(
+            workspace,
+            entry,
+            ui_plan,
+            artifacts_dir,
+        )
+        result["sandbox"] = runtime.get("sandbox", {})
+        result["ui"] = runtime.get("ui", {})
+
+        result["ok"] = bool(
+            result["compile"].get("ok")
+            and result["pytest"].get("ok")
+            and result["sandbox"].get("ok")
+            and result["ui"].get("ok")
+        )
+        result["quality"] = self.full_verification_quality(result)
+        return result
+
+    @staticmethod
+    def verification_failure_output(verification: dict[str, Any], limit: int = 10000) -> str:
+        """Collect concrete compile/test/runtime/UI evidence for failure diagnosis."""
+        sections: list[str] = []
+        compile_result = verification.get("compile", {})
+        if not compile_result.get("ok"):
+            sections.append("COMPILE FAILURE:\n" + json.dumps(compile_result, indent=2)[:4000])
+
+        pytest_result = verification.get("pytest", {})
+        if not pytest_result.get("ok"):
+            sections.append("PYTEST FAILURE:\n" + WorkflowEngine.failed_test_output(pytest_result, limit=6000))
+
+        sandbox = verification.get("sandbox", {})
+        if sandbox and sandbox.get("ok") is not True and sandbox.get("mode") != "not_run":
+            sections.append("SANDBOX FAILURE:\n" + json.dumps(sandbox, indent=2)[:5000])
+
+        ui = verification.get("ui", {})
+        if verification.get("ui_required") and not ui.get("ok"):
+            ui_rows = []
+            for item in ui.get("results", [])[-5:]:
+                ui_rows.append({
+                    "name": item.get("name"),
+                    "ok": item.get("ok"),
+                    "failed_step": item.get("failed_step"),
+                    "error": item.get("error"),
+                    "console_errors": item.get("console_errors", [])[-5:],
+                    "page_errors": item.get("page_errors", [])[-5:],
+                })
+            sections.append(
+                "BROWSER/UI FAILURE:\n"
+                + json.dumps({
+                    "error_type": ui.get("error_type"),
+                    "error": ui.get("error"),
+                    "tests_run": ui.get("tests_run"),
+                    "tests_passed": ui.get("tests_passed"),
+                    "tests_failed": ui.get("tests_failed"),
+                    "results": ui_rows,
+                }, indent=2)[:6000]
+            )
+
+        if not sections:
+            sections.append("No concrete failure evidence was recorded.")
+        return "\n\n".join(sections)[-limit:]
+
+    @staticmethod
+    def _entry_exists_safely(workspace: Path, entry: Any) -> bool:
+        if not isinstance(entry, str) or not entry.strip():
+            return False
+        try:
+            target = WorkflowEngine.safe_path(workspace, entry)
+            return target.exists() and target.is_file()
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _runtime_stage_status(state: WorkflowState, verification: dict[str, Any]) -> None:
+        """Update visible runtime/UI stages from observed verification state."""
+        sandbox = verification.get("sandbox", {})
+        if sandbox.get("mode") == "not_applicable":
+            state.stage_state["sandbox"] = "skipped"
+            state.stage_detail["sandbox"] = sandbox.get("message", "No Streamlit entry point detected.")
+        elif sandbox.get("mode") == "not_run":
+            state.stage_state["sandbox"] = "pending"
+        elif sandbox.get("ok"):
+            state.stage_state["sandbox"] = "done"
+            state.stage_detail["sandbox"] = "Application started and responded successfully"
+        else:
+            state.stage_state["sandbox"] = "error"
+            state.stage_detail["sandbox"] = str(sandbox.get("error") or sandbox.get("message") or "Application startup failed")[:180]
+
+        ui = verification.get("ui", {})
+        if ui.get("mode") == "not_run":
+            state.stage_state["ui_testing"] = "pending"
+        elif ui.get("mode") == "skipped":
+            state.stage_state["ui_testing"] = "skipped"
+            state.stage_detail["ui_testing"] = str(ui.get("message") or "No safe browser tests were generated.")[:180]
+        elif ui.get("ok"):
+            state.stage_state["ui_testing"] = "done"
+            state.stage_detail["ui_testing"] = f"{ui.get('tests_passed', 0)} browser test(s) passed"
+        else:
+            state.stage_state["ui_testing"] = "error"
+            state.stage_detail["ui_testing"] = str(ui.get("error") or "Browser/UI verification failed")[:180]
+
+    def run_streamlit_runtime_checks(
+        self,
+        workspace: Path,
+        entry: str | None,
+        ui_plan: dict[str, Any],
+        artifacts_dir: Path,
+    ) -> dict[str, Any]:
+        """Keep the Streamlit process alive while optional browser tests execute."""
+        if not entry:
+            return {
+                "sandbox": {
+                    "ok": True,
+                    "mode": "not_applicable",
+                    "message": "No Streamlit entry point detected.",
+                },
+                "ui": {
+                    "ok": True,
+                    "mode": "skipped",
+                    "message": "Browser testing skipped because no Streamlit entry point was detected.",
+                    "tests_run": 0,
+                    "tests_passed": 0,
+                    "tests_failed": 0,
+                    "results": [],
+                },
+            }
+
+        target = self.safe_path(workspace, entry)
+        if not target.exists() or target.suffix != ".py":
+            return {
+                "sandbox": {
+                    "ok": False,
+                    "error_type": "project",
+                    "error": "Streamlit entry file does not exist.",
+                },
+                "ui": {
+                    "ok": False,
+                    "mode": "not_run",
+                    "message": "Browser tests were deferred because the application entry file is invalid.",
+                },
+            }
+
+        try:
+            entry_source = self.read_text(workspace, entry)
+        except Exception as exc:
+            return {
+                "sandbox": {
+                    "ok": False,
+                    "error_type": "project",
+                    "error": f"Could not inspect the application entry point: {exc}",
+                },
+                "ui": {
+                    "ok": False,
+                    "mode": "not_run",
+                    "message": "Browser tests were deferred because the entry point could not be inspected.",
+                },
+            }
+
+        if "streamlit" not in entry_source.lower():
+            return {
+                "sandbox": {
+                    "ok": True,
+                    "mode": "not_applicable",
+                    "message": "Entry point is not a Streamlit application; sandbox/UI browser checks skipped.",
+                },
+                "ui": {
+                    "ok": True,
+                    "mode": "skipped",
+                    "message": "Browser testing currently targets Streamlit applications.",
+                    "tests_run": 0,
+                    "tests_passed": 0,
+                    "tests_failed": 0,
+                    "results": [],
+                },
+            }
+
+        import socket
+        import requests
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        proc = None
+        env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        }
+
+        try:
+            python_executable = sys.executable or "python"
+            streamlit_check = subprocess.run(
+                [python_executable, "-c", "import streamlit"],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+            )
+            if streamlit_check.returncode != 0:
+                return {
+                    "sandbox": {
+                        "ok": False,
+                        "error_type": "infrastructure",
+                        "error": "Streamlit is not available in the DevPilot Python environment.",
+                        "startup_log": (streamlit_check.stderr or streamlit_check.stdout or "")[-6000:],
+                    },
+                    "ui": {
+                        "ok": False,
+                        "mode": "not_run",
+                        "message": "Browser tests were deferred because Streamlit is unavailable.",
+                    },
+                }
+
+            proc = subprocess.Popen(
+                [
+                    python_executable,
+                    "-m",
+                    "streamlit",
+                    "run",
+                    entry,
+                    "--server.headless",
+                    "true",
+                    "--server.address",
+                    "127.0.0.1",
+                    "--server.port",
+                    str(port),
+                    "--browser.gatherUsageStats",
+                    "false",
+                ],
+                cwd=str(workspace),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+
+            deadline = time.time() + 12
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    output = proc.stdout.read()[-6000:] if proc.stdout else ""
+                    return {
+                        "sandbox": {
+                            "ok": False,
+                            "error_type": "project_or_environment",
+                            "returncode": proc.returncode,
+                            "error": "Streamlit exited before becoming ready.",
+                            "startup_log": output,
+                        },
+                        "ui": {
+                            "ok": False,
+                            "mode": "not_run",
+                            "message": "Browser tests were deferred because Streamlit did not start.",
+                        },
+                    }
+
+                try:
+                    response = requests.get(f"http://127.0.0.1:{port}", timeout=1)
+                    if response.status_code == 200:
+                        sandbox = {
+                            "ok": True,
+                            "mode": "streamlit_smoke",
+                            "http_status": response.status_code,
+                            "port": port,
+                        }
+                        if ui_plan.get("enabled"):
+                            ui = run_browser_ui_tests(
+                                f"http://127.0.0.1:{port}",
+                                ui_plan,
+                                artifacts_dir,
+                            )
+                        else:
+                            ui = {
+                                "ok": True,
+                                "mode": "skipped",
+                                "message": ui_plan.get("reason") or "No safe UI tests were generated.",
+                                "tests_run": 0,
+                                "tests_passed": 0,
+                                "tests_failed": 0,
+                                "results": [],
+                            }
+                        return {"sandbox": sandbox, "ui": ui}
+                except requests.RequestException:
+                    pass
+
+                time.sleep(0.4)
+
+            return {
+                "sandbox": {
+                    "ok": False,
+                    "error_type": "project_or_environment",
+                    "error": "Streamlit did not become ready before timeout.",
+                },
+                "ui": {
+                    "ok": False,
+                    "mode": "not_run",
+                    "message": "Browser tests were deferred because Streamlit did not become ready.",
+                },
+            }
+
+        except Exception as exc:
+            return {
+                "sandbox": {
+                    "ok": False,
+                    "error_type": "infrastructure",
+                    "error": str(exc),
+                },
+                "ui": {
+                    "ok": False,
+                    "mode": "not_run",
+                    "message": "Browser tests could not start.",
+                },
+            }
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
     def verify_project(self, workspace: Path) -> dict[str, Any]:
         """Run the deterministic verification stack once and return both results."""
@@ -987,6 +1660,7 @@ class WorkflowEngine:
                             "ok": True,
                             "mode": "streamlit_smoke",
                             "http_status": response.status_code,
+                            "port": port,
                         }
                 except requests.RequestException:
                     pass
@@ -1221,12 +1895,53 @@ Rules:
             self.update(state, "test_generation", "done", "Focused tests prepared")
 
             # 6-8 Verification / failure analysis / autonomous repair loop
-            # The loop is intentionally closed: test -> diagnose -> patch -> retest.
-            # Each repair is reversible, and a repair that makes verification worse
-            # is rolled back before another strategy is attempted.
-            verification = self.verify_project(state.workspace)
+            # Feature 7 extends the closed loop so that a UI failure can also trigger
+            # the same bounded, reversible repair cycle used for pytest failures.
+            entry = inspection.get("entry_point") or "app.py"
+            ui_artifacts_dir = state.workspace.parent / "devpilot_ui_artifacts"
+
+            self.update(state, "ui_testing", "active", "Preparing safe browser test plan")
+            ui_plan = self.generate_ui_test_plan(
+                state,
+                requirement,
+                inspection,
+                current_snippets,
+            )
+            state.verification["ui_test_plan"] = ui_plan
+            self.event(
+                state,
+                "Browser UI test plan prepared",
+                True,
+                {
+                    "enabled": bool(ui_plan.get("enabled")),
+                    "tests": len(ui_plan.get("tests", []) or []),
+                    "reason": ui_plan.get("reason", ""),
+                },
+            )
+            if ui_plan.get("enabled"):
+                self.update(
+                    state,
+                    "ui_testing",
+                    "done",
+                    f"Prepared {len(ui_plan.get('tests', []) or [])} browser test(s)",
+                )
+            else:
+                self.update(
+                    state,
+                    "ui_testing",
+                    "skipped",
+                    str(ui_plan.get("reason", "No safe UI tests generated."))[:180],
+                )
+
+            verification = self.verify_all(
+                state.workspace,
+                entry if self._entry_exists_safely(state.workspace, entry) else None,
+                ui_plan,
+                ui_artifacts_dir,
+            )
             state.verification["initial_verification"] = verification
             self.record_verification(state, "before_repair", verification)
+            self._runtime_stage_status(state, verification)
 
             for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
                 compile_result = verification["compile"]
@@ -1246,14 +1961,16 @@ Rules:
                     {
                         "compile": compile_result,
                         "pytest": pytest_result,
+                        "sandbox": verification.get("sandbox", {}),
+                        "ui": verification.get("ui", {}),
                         "quality": verification["quality"],
                     },
                 )
 
                 if testing_ok:
                     state.verification["final_tests"] = verification
-                    self.update(state, "testing", "done", "Compile and tests passed")
-                    self.update(state, "failure_analysis", "skipped", "No test failures")
+                    self.update(state, "testing", "done", "Compile, tests, runtime and required UI checks passed")
+                    self.update(state, "failure_analysis", "skipped", "No verification failures")
                     if state.repair_attempts:
                         self.update(
                             state,
@@ -1263,29 +1980,33 @@ Rules:
                         )
                     else:
                         self.update(state, "repair", "skipped", "No repair required")
+                    self._runtime_stage_status(state, verification)
                     break
 
                 state.verification["latest_failure"] = {
                     "compile": compile_result,
                     "pytest": pytest_result,
+                    "sandbox": verification.get("sandbox", {}),
+                    "ui": verification.get("ui", {}),
                     "quality": verification["quality"],
                 }
 
-                self.update(state, "testing", "error", "Verification tests failed")
+                self.update(state, "testing", "error", "Verification checks failed")
+                self._runtime_stage_status(state, verification)
 
-                # No third diagnosis is needed when the bounded repair budget is
-                # exhausted. This keeps the loop deterministic and avoids spending
-                # another model call when there is no repair slot left.
                 if attempt >= MAX_REPAIR_ATTEMPTS:
                     self.fail(state, "Maximum repair attempts reached.", "repair")
                     return self._finish(state)
 
                 self.update(state, "failure_analysis", "active", "Diagnosing the observed failure")
 
-                failure_text = self.failed_test_output(pytest_result)
+                failure_text = self.verification_failure_output(verification)
                 failure_payload = {
                     "compile": compile_result,
                     "pytest": pytest_result,
+                    "sandbox": verification.get("sandbox", {}),
+                    "ui": verification.get("ui", {}),
+                    "ui_test_plan": ui_plan,
                     "failure_output": failure_text,
                     "repair_history": state.repair_history[-3:],
                 }
@@ -1302,11 +2023,14 @@ Return JSON only:
   "strategy": "brief repair strategy"
 }
 Rules:
-- Read the exact pytest/compile output, including expected vs actual values.
+- Read the exact compile, pytest, sandbox, and browser/UI evidence supplied.
+- For pytest, read exact expected vs actual values when present.
+- For browser/UI failures, use the failed step, visible target/value, application errors, and screenshot path as evidence when available.
 - If an existing test asserts an exact old return shape and the requested requirement intentionally adds a field or changes that contract, classify it as a project/test-contract failure and set repair_needed=true.
 - Do NOT call an intentional requirement change an infrastructure failure.
-- Mark infrastructure only for environment/tooling failures (missing runtime, dependency installation failure, OS/process failure, etc.).
-- target_files must contain only files that are clearly implicated by the failure output or provided project context.
+- Mark infrastructure only for environment/tooling failures such as a missing runtime, failed dependency/browser installation, OS/process failure, or unavailable browser engine.
+- A browser security/configuration failure must not trigger arbitrary project edits; use repair_needed=false unless the supplied project evidence clearly shows a safe project-side cause.
+- target_files must contain only files that are clearly implicated by the failure evidence or supplied project context.
 - Never invent a failure cause that is not supported by the supplied evidence.
 - Use repair_needed=false when the evidence does not support a safe focused code/test repair.
 """,
@@ -1339,7 +2063,6 @@ Rules:
                     str(analysis.get("cause", "Project failure"))[:120],
                 )
 
-                # Narrow the next repair's context to implicated files when possible.
                 target_files = analysis.get("target_files", [])
                 if not isinstance(target_files, list):
                     target_files = []
@@ -1375,8 +2098,26 @@ Rules:
                     except Exception:
                         pass
 
-                repair = self.llm_json(
-                    """
+                deterministic_repair = self.deterministic_contract_test_repair(
+                    state.workspace,
+                    failure_text,
+                    requirement,
+                )
+
+                if deterministic_repair and verification.get("ui", {}).get("ok", True):
+                    repair = deterministic_repair
+                    self.event(
+                        state,
+                        "Deterministic test-contract repair selected",
+                        True,
+                        {
+                            "changed_area": "stale exact dictionary assertion",
+                            "notes": repair.get("notes", ""),
+                        },
+                    )
+                else:
+                    repair = self.llm_json(
+                        """
 You are the repair specialist for a closed-loop software development agent.
 Return focused edits only:
 {
@@ -1392,17 +2133,19 @@ Rules:
 - Do not rewrite whole files.
 - Do not modify secret files.
 - Do not create dependency-shadowing files.
-- Read the latest pytest/compile evidence before deciding what to change.
+- Read the latest compile/pytest/runtime/browser evidence before deciding what to change.
+- For UI failures, make the smallest project-side change needed to satisfy the failed user-visible interaction.
 - Preserve behavior outside the requirement.
 - If the implementation intentionally adds a field to a returned dictionary and an existing test uses exact dictionary equality for the old contract, update that test to assert the new required field and keep the existing assertions intact.
 - Do NOT remove a newly required field merely to make an old test pass.
 - Never weaken tests with `assert True`, unconditional skips, or by deleting the failing assertion.
 - Keep completed/open behavior and unrelated tests unchanged.
+- Do not change infrastructure settings or browser-security restrictions to force a UI test to pass.
 - Prefer the smallest patch that addresses the diagnosed cause.
 """,
-                    f"Failure analysis:\n{json.dumps(analysis)[:7000]}\n\nLatest failure evidence:\n{failure_text[:7000]}\n\nCurrent focused code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
-                    state,
-                )
+                        f"Failure analysis:\n{json.dumps(analysis)[:7000]}\n\nLatest verification evidence:\n{failure_text[:9000]}\n\nUI test plan:\n{json.dumps(ui_plan)[:7000]}\n\nCurrent focused code:\n{chr(10).join(current_code)[:MAX_CONTEXT_CHARS]}",
+                        state,
+                    )
 
                 repair_edits = self.normalize_edits(repair)
                 repair_result = self.apply_edits(state.workspace, repair_edits)
@@ -1431,14 +2174,18 @@ Rules:
                     },
                 )
 
-                # Immediate retest closes the agentic loop and gives the next
-                # diagnosis concrete evidence from the exact repair just made.
-                post_repair = self.verify_project(state.workspace)
+                post_repair = self.verify_all(
+                    state.workspace,
+                    entry if self._entry_exists_safely(state.workspace, entry) else None,
+                    ui_plan,
+                    ui_artifacts_dir,
+                )
                 self.record_verification(
                     state,
                     f"after_repair_{state.repair_attempts}",
                     post_repair,
                 )
+                self._runtime_stage_status(state, post_repair)
                 self.event(
                     state,
                     f"Retest after repair {state.repair_attempts}",
@@ -1446,6 +2193,8 @@ Rules:
                     {
                         "compile": post_repair["compile"],
                         "pytest": post_repair["pytest"],
+                        "sandbox": post_repair.get("sandbox", {}),
+                        "ui": post_repair.get("ui", {}),
                         "quality": post_repair["quality"],
                     },
                 )
@@ -1471,9 +2220,6 @@ Rules:
                     verification = post_repair
                     continue
 
-                # Never silently keep a repair that made deterministic verification
-                # worse. Restore exactly what that repair changed and confirm the
-                # rollback itself is healthy before another attempt.
                 if after_quality < before_quality:
                     rollback = self.rollback_changes(
                         state.workspace,
@@ -1486,12 +2232,18 @@ Rules:
                         rollback,
                     )
 
-                    restored_verification = self.verify_project(state.workspace)
+                    restored_verification = self.verify_all(
+                        state.workspace,
+                        entry if self._entry_exists_safely(state.workspace, entry) else None,
+                        ui_plan,
+                        ui_artifacts_dir,
+                    )
                     self.record_verification(
                         state,
                         f"after_rollback_{state.repair_attempts}",
                         restored_verification,
                     )
+                    self._runtime_stage_status(state, restored_verification)
                     rollback_ok = rollback["ok"] and (
                         restored_verification["quality"] == before_quality
                     )
@@ -1504,6 +2256,8 @@ Rules:
                             "expected_quality": before_quality,
                             "compile": restored_verification["compile"],
                             "pytest": restored_verification["pytest"],
+                            "sandbox": restored_verification.get("sandbox", {}),
+                            "ui": restored_verification.get("ui", {}),
                         },
                     )
 
@@ -1542,37 +2296,31 @@ Rules:
                     "done",
                     f"Repair {state.repair_attempts} did not verify; continuing diagnosis",
                 )
-
-                # Continue to the next loop iteration with the exact post-repair
-                # (or post-rollback) verification evidence.
                 state.verification["repair_history"] = state.repair_history[-5:]
             else:
                 self.fail(state, "Verification loop ended without a terminal result.", "testing")
                 return self._finish(state)
 
-            # 9. Sandbox verification
-            self.update(state, "sandbox", "active", "Running Streamlit smoke verification")
-            entry = inspection.get("entry_point") or "app.py"
-            entry_path = state.workspace / str(entry)
-
-            if entry_path.exists():
-                smoke = self.smoke_test_streamlit(state.workspace, str(entry))
-            else:
-                smoke = {
-                    "ok": True,
-                    "mode": "streamlit_smoke",
-                    "message": "No Streamlit entry point detected.",
-                }
-
-            state.verification["sandbox"] = smoke
-            self.event(state, "Sandbox verification", smoke.get("ok", False), smoke)
-
-            if not smoke.get("ok", False):
+            # The final successful verification already contains compile/pytest,
+            # sandbox, and browser results. No second application launch is needed.
+            self._runtime_stage_status(state, verification)
+            if not verification.get("sandbox", {}).get("ok"):
                 self.build_engineering_report(state, requirement)
-                self.fail(state, f"Sandbox verification failed: {smoke.get('error', 'unknown error')}", "sandbox")
+                self.fail(
+                    state,
+                    f"Sandbox verification failed: {verification.get('sandbox', {}).get('error', 'unknown error')}",
+                    "sandbox",
+                )
                 return self._finish(state)
 
-            self.update(state, "sandbox", "done", "Application responded successfully")
+            if ui_plan.get("enabled") and not verification.get("ui", {}).get("ok"):
+                self.build_engineering_report(state, requirement)
+                self.fail(
+                    state,
+                    f"Browser/UI verification failed: {verification.get('ui', {}).get('error', 'unknown error')}",
+                    "ui_testing",
+                )
+                return self._finish(state)
 
             # 10. Final report
             engineering_report = self.build_engineering_report(state, requirement)
