@@ -267,13 +267,16 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    secret_api_key = st.secrets.get("GROQ_API_KEY", "")
+    secret_model = st.secrets.get("GROQ_MODEL", DEFAULT_MODEL)
+
     api_key = st.text_input(
         "Groq API key",
         type="password",
-        value=os.getenv("GROQ_API_KEY", ""),
+        value=os.getenv("GROQ_API_KEY", secret_api_key),
     )
 
-    model = st.text_input("Model", value=DEFAULT_MODEL)
+    model = st.text_input("Model", value=os.getenv("GROQ_MODEL", secret_model))
 
     st.markdown(
         """
